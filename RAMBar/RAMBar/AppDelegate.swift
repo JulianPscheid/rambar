@@ -1,7 +1,7 @@
 import Cocoa
 import SwiftUI
 
-class AppDelegate: NSObject, NSApplicationDelegate {
+class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var statusItem: NSStatusItem!
     private var popover: NSPopover!
     private var updateTimer: Timer?
@@ -25,6 +25,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         popover = NSPopover()
         popover.contentSize = NSSize(width: 380, height: 520)
         popover.behavior = .transient
+        popover.delegate = self
         popover.animates = true
         popover.contentViewController = NSHostingController(rootView: view)
 
@@ -50,7 +51,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         if popover.isShown {
             popover.performClose(nil)
-            contentView?.setPopoverVisible(false)
         } else {
             contentView?.setPopoverVisible(true)
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
@@ -58,6 +58,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             // Ensure popover window is key
             popover.contentViewController?.view.window?.makeKey()
         }
+    }
+
+    func popoverDidClose(_ notification: Notification) {
+        contentView?.setPopoverVisible(false)
     }
 
     private func updateStatusButton() {

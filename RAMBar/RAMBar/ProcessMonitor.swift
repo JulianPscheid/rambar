@@ -121,18 +121,13 @@ class ProcessMonitor {
         let snapshots = processes.map(\.snapshot)
         let groups = groupClaudeProcessTrees(snapshots)
         let orphanSummary = claudeOrphanTracker.update(processes: snapshots, groups: groups)
+        let workingDirectories = getWorkingDirectories(for: groups.map { $0.root.pid })
         var sessions: [ClaudeSession] = []
 
         for group in groups {
             let process = group.root
             let helpers = group.helperSummary
-            var workingDir = "Unknown"
-            if let lsofOutput = shell("lsof -p \(process.pid) 2>/dev/null | grep cwd | awk '{print $NF}' | head -1") {
-                let dir = lsofOutput.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !dir.isEmpty {
-                    workingDir = dir
-                }
-            }
+            let workingDir = workingDirectories[process.pid] ?? "Unknown"
 
             let pathComponents = workingDir.split(separator: "/")
             let projectName = pathComponents.last.map(String.init) ?? "Unknown"
@@ -167,14 +162,23 @@ class ProcessMonitor {
         )
     }
 
+    private func getWorkingDirectories(for pids: [Int32]) -> [Int32: String] {
+        guard !pids.isEmpty else { return [:] }
+
+        let pidList = pids.map(String.init).joined(separator: ",")
+        guard let output = shell("lsof -a -d cwd -p \(pidList) -Fn") else { return [:] }
+        return parseWorkingDirectories(output)
+    }
+
     /// Get Chrome tabs (approximation based on renderer processes)
     func getChromeTabs(from processes: [ProcessInfo]) -> [ChromeTab] {
         let renderers = processes.filter {
             $0.command.contains("Google Chrome Helper (Renderer)")
         }.sorted { $0.memory > $1.memory }
+        guard !renderers.isEmpty else { return [] }
 
-        // Get actual tab info via AppleScript
-        var tabInfo: [(title: String, url: String)] = []
+        // Get actual tab titles via AppleScript
+        var tabTitles: [String] = []
 
         if let output = shell("""
             osascript -e 'tell application "Google Chrome"
@@ -183,8 +187,7 @@ class ProcessMonitor {
                     repeat with w from 1 to (count of windows)
                         repeat with t from 1 to (count of tabs of window w)
                             set tabTitle to title of tab t of window w
-                            set tabURL to URL of tab t of window w
-                            set tabList to tabList & tabTitle & "|||" & tabURL & "\\n"
+                            set tabList to tabList & tabTitle & "\\n"
                         end repeat
                     end repeat
                 end try
@@ -192,30 +195,33 @@ class ProcessMonitor {
             end tell' 2>/dev/null
             """) {
             let lines = output.components(separatedBy: "\n")
-            for line in lines where line.contains("|||") {
-                let parts = line.components(separatedBy: "|||")
-                if parts.count >= 2 {
-                    tabInfo.append((title: parts[0], url: parts[1]))
-                }
+            for line in lines where !line.isEmpty {
+                tabTitles.append(line)
             }
         }
 
         // Match tabs with renderer processes (approximate)
         var tabs: [ChromeTab] = []
         for (index, process) in renderers.prefix(15).enumerated() {
-            let info = index < tabInfo.count ? tabInfo[index] : (title: "Chrome Tab \(index + 1)", url: "")
-            let title = info.title.trimmingCharacters(in: .whitespaces)
+            let tabTitle = index < tabTitles.count ? tabTitles[index] : "Chrome Tab \(index + 1)"
+            let title = tabTitle.trimmingCharacters(in: .whitespaces)
             if title.isEmpty || title.lowercased() == "chrome" || title.lowercased() == "new tab" {
                 continue
             }
             tabs.append(ChromeTab(
+                pid: process.pid,
                 title: String(title.prefix(50)),
-                url: info.url,
                 memory: process.memory
             ))
         }
 
         return tabs
+    }
+
+    func getChromeRendererCount(from processes: [ProcessInfo]) -> Int {
+        processes.count {
+            $0.command.contains("Google Chrome Helper (Renderer)")
+        }
     }
 
     /// Get Python processes

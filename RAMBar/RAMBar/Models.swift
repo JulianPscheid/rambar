@@ -40,11 +40,12 @@ enum MemoryStatus {
 // MARK: - Process Models
 
 struct AppMemory: Identifiable {
-    let id = UUID()
     let name: String
     let memory: UInt64  // bytes
     let processCount: Int
     let color: String
+
+    var id: String { name }
 
     var memoryMB: Double { Double(memory) / 1_048_576 }
     var memoryGB: Double { Double(memory) / 1_073_741_824 }
@@ -58,7 +59,6 @@ struct AppMemory: Identifiable {
 }
 
 struct ClaudeSession: Identifiable {
-    let id = UUID()
     let pid: Int32
     let projectName: String
     let workingDirectory: String
@@ -68,6 +68,8 @@ struct ClaudeSession: Identifiable {
     let helperProcessCount: Int
     let nodeProcessCount: Int
     let pythonProcessCount: Int
+
+    var id: Int32 { pid }
 
     var memoryMB: Double { Double(memory) / 1_048_576 }
     var needsAttention: Bool {
@@ -103,10 +105,11 @@ struct ClaudeProcessReport {
 }
 
 struct ChromeTab: Identifiable {
-    let id = UUID()
+    let pid: Int32
     let title: String
-    let url: String
     let memory: UInt64
+
+    var id: Int32 { pid }
 
     var memoryMB: Double { Double(memory) / 1_048_576 }
 
@@ -116,10 +119,11 @@ struct ChromeTab: Identifiable {
 }
 
 struct PythonProcess: Identifiable {
-    let id = UUID()
     let pid: Int32
     let script: String
     let memory: UInt64
+
+    var id: Int32 { pid }
 
     var memoryMB: Double { Double(memory) / 1_048_576 }
 
@@ -132,10 +136,11 @@ struct PythonProcess: Identifiable {
 }
 
 struct VSCodeWorkspace: Identifiable {
-    let id = UUID()
     let name: String
     let memory: UInt64
     let processCount: Int
+
+    var id: String { name }
 
     var memoryMB: Double { Double(memory) / 1_048_576 }
 
@@ -150,9 +155,10 @@ struct VSCodeWorkspace: Identifiable {
 // MARK: - Diagnostic
 
 struct Diagnostic: Identifiable {
-    let id = UUID()
     let message: String
     let severity: DiagnosticSeverity
+
+    var id: String { message }
 }
 
 enum DiagnosticSeverity {
@@ -167,6 +173,7 @@ struct RAMBarState {
     var claudeSessions: [ClaudeSession] = []
     var orphanedClaudeProcesses: OrphanedClaudeProcesses = .empty
     var chromeTabs: [ChromeTab] = []
+    var chromeTabCount: Int = 0
     var pythonProcesses: [PythonProcess] = []
     var vscodeWorkspaces: [VSCodeWorkspace] = []
     var diagnostics: [Diagnostic] = []

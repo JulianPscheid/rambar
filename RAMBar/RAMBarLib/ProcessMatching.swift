@@ -69,6 +69,26 @@ public func parseProcessList(
     }
 }
 
+/// Parses `lsof -a -d cwd -p <pid-list> -Fn` output into working directories.
+public func parseWorkingDirectories(_ output: String) -> [Int32: String] {
+    var currentPid: Int32?
+    var directories: [Int32: String] = [:]
+
+    for line in output.split(separator: "\n", omittingEmptySubsequences: true) {
+        switch line.first {
+        case "p":
+            currentPid = Int32(line.dropFirst())
+        case "n":
+            guard let currentPid else { continue }
+            directories[currentPid] = String(line.dropFirst())
+        default:
+            continue
+        }
+    }
+
+    return directories
+}
+
 /// One interactive Claude Code process and every process descended from it.
 public struct ClaudeProcessGroup {
     public let root: ProcessSnapshot

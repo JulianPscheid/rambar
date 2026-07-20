@@ -25,6 +25,37 @@ final class ProcessMatchingTests: XCTestCase {
         XCTAssertEqual(processes[1].memory, 2_097_152, "RSS should remain as a fallback")
     }
 
+    func testParseWorkingDirectoriesMapsBatchedLsofOutputByPid() {
+        let output = """
+        p100
+        fcwd
+        n/Users/max/Projects/one
+        p200
+        fcwd
+        n/Users/max/Projects/two with spaces
+        """
+
+        XCTAssertEqual(parseWorkingDirectories(output), [
+            100: "/Users/max/Projects/one",
+            200: "/Users/max/Projects/two with spaces",
+        ])
+    }
+
+    func testParseWorkingDirectoriesIgnoresMalformedAndMissingPaths() {
+        let output = """
+        n/path-before-a-pid
+        pnot-a-number
+        n/path-for-invalid-pid
+        p300
+        fcwd
+        p400
+        fcwd
+        n/valid/path
+        """
+
+        XCTAssertEqual(parseWorkingDirectories(output), [400: "/valid/path"])
+    }
+
     // MARK: - Pattern matching
 
     func testClaudeCliMatchesClaude() {
