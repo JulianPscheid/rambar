@@ -67,6 +67,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let percent = Int(memory.usagePercent)
 
         // Create attributed string with icon and percentage
+        let font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
         let attachment = NSTextAttachment()
         let config = NSImage.SymbolConfiguration(pointSize: 12, weight: .medium)
 
@@ -87,14 +88,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         if let symbol = NSImage(systemSymbolName: symbolName, accessibilityDescription: nil)?
             .withSymbolConfiguration(config) {
-            attachment.image = symbol.tinted(with: color)
+            let tintedSymbol = symbol.tinted(with: color)
+            attachment.image = tintedSymbol
+            attachment.bounds = NSRect(
+                x: 0,
+                y: (font.capHeight - tintedSymbol.size.height) / 2,
+                width: tintedSymbol.size.width,
+                height: tintedSymbol.size.height
+            )
         }
 
         let attachmentString = NSAttributedString(attachment: attachment)
         let percentString = NSAttributedString(
             string: " \(percent)%",
             attributes: [
-                .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium),
+                .font: font,
                 .foregroundColor: color
             ]
         )
