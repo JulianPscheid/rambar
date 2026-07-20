@@ -126,6 +126,25 @@ class CrashDetector: ObservableObject {
         UNUserNotificationCenter.current().add(request)
     }
 
+    func sendOrphanedClaudeWarning(processCount: Int, memory: UInt64) {
+        let memoryMB = Double(memory) / 1_048_576
+        let formattedMemory = memoryMB >= 1024
+            ? String(format: "%.1f GB", memoryMB / 1024)
+            : String(format: "%.0f MB", memoryMB)
+        let content = UNMutableNotificationContent()
+        content.title = "Claude Helpers Still Running"
+        content.body = "\(processCount) processes survived a closed session and are using \(formattedMemory)"
+        content.sound = .default
+
+        let request = UNNotificationRequest(
+            identifier: "claude-orphan-warning",
+            content: content,
+            trigger: nil
+        )
+
+        UNUserNotificationCenter.current().add(request)
+    }
+
     // MARK: - Logging
 
     private func logCrash(appName: String, bundleId: String) {

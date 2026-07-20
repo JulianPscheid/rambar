@@ -62,10 +62,17 @@ struct ClaudeSession: Identifiable {
     let pid: Int32
     let projectName: String
     let workingDirectory: String
+    let terminal: String
     let memory: UInt64
     let processCount: Int
+    let helperProcessCount: Int
+    let nodeProcessCount: Int
+    let pythonProcessCount: Int
 
     var memoryMB: Double { Double(memory) / 1_048_576 }
+    var needsAttention: Bool {
+        claudeSessionNeedsAttention(memory: memory, processCount: processCount)
+    }
 
     var formattedMemory: String {
         if memoryMB >= 1024 {
@@ -73,6 +80,26 @@ struct ClaudeSession: Identifiable {
         }
         return String(format: "%.0f MB", memoryMB)
     }
+}
+
+struct OrphanedClaudeProcesses {
+    let processCount: Int
+    let memory: UInt64
+
+    static let empty = OrphanedClaudeProcesses(processCount: 0, memory: 0)
+
+    var formattedMemory: String {
+        let memoryMB = Double(memory) / 1_048_576
+        if memoryMB >= 1024 {
+            return String(format: "%.1f GB", memoryMB / 1024)
+        }
+        return String(format: "%.0f MB", memoryMB)
+    }
+}
+
+struct ClaudeProcessReport {
+    let sessions: [ClaudeSession]
+    let orphanedProcesses: OrphanedClaudeProcesses
 }
 
 struct ChromeTab: Identifiable {
@@ -138,6 +165,7 @@ struct RAMBarState {
     var systemMemory: SystemMemory?
     var apps: [AppMemory] = []
     var claudeSessions: [ClaudeSession] = []
+    var orphanedClaudeProcesses: OrphanedClaudeProcesses = .empty
     var chromeTabs: [ChromeTab] = []
     var pythonProcesses: [PythonProcess] = []
     var vscodeWorkspaces: [VSCodeWorkspace] = []

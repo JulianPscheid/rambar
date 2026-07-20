@@ -194,6 +194,78 @@ final class ProcessMatchingTests: XCTestCase {
         XCTAssertTrue(groupClaudeProcessTrees(processes).isEmpty)
     }
 
+    func testClaudeHelperSummaryCountsDescendantTypes() throws {
+        let processes: [ProcessSnapshot] = [
+            ProcessSnapshot(pid: 100, parentPid: 10, terminal: "ttys001", command: "claude", memory: 500_000_000),
+            ProcessSnapshot(pid: 101, parentPid: 100, command: "npm exec mcp-server", memory: 100_000_000),
+            ProcessSnapshot(pid: 102, parentPid: 101, command: "/opt/homebrew/bin/node mcp-server.js", memory: 200_000_000),
+            ProcessSnapshot(pid: 103, parentPid: 100, command: "/usr/bin/python3 tool.py", memory: 300_000_000),
+            ProcessSnapshot(pid: 104, parentPid: 100, command: "claude bg-spare", memory: 150_000_000),
+        ]
+
+        let group = try XCTUnwrap(groupClaudeProcessTrees(processes).first)
+        let summary = group.helperSummary
+
+        XCTAssertEqual(summary.total, 4)
+        XCTAssertEqual(summary.node, 1)
+        XCTAssertEqual(summary.python, 1)
+        XCTAssertEqual(summary.claude, 1)
+    }
+
+    func testClaudeSessionWarningThresholds() {
+        let threeGiB = UInt64(3 * 1_073_741_824)
+        XCTAssertFalse(claudeSessionNeedsAttention(memory: threeGiB - 1, processCount: 39))
+        XCTAssertTrue(claudeSessionNeedsAttention(memory: threeGiB, processCount: 39))
+        XCTAssertTrue(claudeSessionNeedsAttention(memory: 1_000_000_000, processCount: 40))
+    }
+
+    func testClaudeOrphanTrackerReportsSurvivingHelpersOnceAndClearsThem() throws {
+        let initialProcesses: [ProcessSnapshot] = [
+            ProcessSnapshot(pid: 100, parentPid: 10, terminal: "ttys001", command: "claude", memory: 500_000_000),
+            ProcessSnapshot(pid: 101, parentPid: 100, command: "npm exec mcp-server", memory: 100_000_000),
+            ProcessSnapshot(pid: 102, parentPid: 101, command: "/opt/homebrew/bin/node mcp-server.js", memory: 200_000_000),
+        ]
+        let initialGroup = try XCTUnwrap(groupClaudeProcessTrees(initialProcesses).first)
+        var tracker = ClaudeOrphanTracker()
+
+        let initial = tracker.update(processes: initialProcesses, groups: [initialGroup])
+        XCTAssertEqual(initial.processCount, 0)
+
+        let survivingHelpers: [ProcessSnapshot] = [
+            ProcessSnapshot(pid: 101, parentPid: 1, command: "npm exec mcp-server", memory: 100_000_000),
+            ProcessSnapshot(pid: 102, parentPid: 101, command: "/opt/homebrew/bin/node mcp-server.js", memory: 200_000_000),
+        ]
+        let detected = tracker.update(processes: survivingHelpers, groups: [])
+        XCTAssertEqual(detected.processCount, 2)
+        XCTAssertEqual(detected.memory, 300_000_000)
+        XCTAssertEqual(detected.newProcessCount, 2)
+
+        let repeated = tracker.update(processes: survivingHelpers, groups: [])
+        XCTAssertEqual(repeated.processCount, 2)
+        XCTAssertEqual(repeated.newProcessCount, 0, "Persistent orphans should not trigger repeated notifications")
+
+        let cleared = tracker.update(processes: [], groups: [])
+        XCTAssertEqual(cleared.processCount, 0)
+        XCTAssertEqual(cleared.memory, 0)
+    }
+
+    func testClaudeOrphanTrackerIgnoresReusedProcessIDs() throws {
+        let initialProcesses: [ProcessSnapshot] = [
+            ProcessSnapshot(pid: 100, parentPid: 10, terminal: "ttys001", command: "claude", memory: 500_000_000),
+            ProcessSnapshot(pid: 101, parentPid: 100, command: "/opt/homebrew/bin/node mcp-server.js", memory: 200_000_000),
+        ]
+        let initialGroup = try XCTUnwrap(groupClaudeProcessTrees(initialProcesses).first)
+        var tracker = ClaudeOrphanTracker()
+        _ = tracker.update(processes: initialProcesses, groups: [initialGroup])
+
+        let reusedPid = [
+            ProcessSnapshot(pid: 101, parentPid: 1, command: "/Applications/Unrelated.app/Contents/MacOS/Unrelated", memory: 900_000_000),
+        ]
+        let result = tracker.update(processes: reusedPid, groups: [])
+
+        XCTAssertEqual(result.processCount, 0, "A PID reused by another executable is not an orphaned Claude helper")
+    }
+
     func testFilterClaudeSessions_OnlyCliProcesses() {
         let processes: [ProcessSnapshot] = [
             ProcessSnapshot(pid: 100, command: "claude --dangerously-skip-permissions", memory: 1_600_000_000),

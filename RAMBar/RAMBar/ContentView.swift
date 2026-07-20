@@ -133,7 +133,7 @@ class RAMBarViewModel: ObservableObject {
             // Get process data once and reuse it across all queries
             let processes = ProcessMonitor.shared.getProcessList()
             let apps = ProcessMonitor.shared.getAppMemory(from: processes)
-            let claude = ProcessMonitor.shared.getClaudeSessions(from: processes)
+            let claude = ProcessMonitor.shared.getClaudeProcessReport(from: processes)
             let python = ProcessMonitor.shared.getPythonProcesses(from: processes)
             let vscode = ProcessMonitor.shared.getVSCodeWorkspaces(from: processes)
             let chrome = ProcessMonitor.shared.getChromeTabs(from: processes)
@@ -141,7 +141,8 @@ class RAMBarViewModel: ObservableObject {
             var newState = RAMBarState()
             newState.systemMemory = memory
             newState.apps = apps
-            newState.claudeSessions = claude
+            newState.claudeSessions = claude.sessions
+            newState.orphanedClaudeProcesses = claude.orphanedProcesses
             newState.pythonProcesses = python
             newState.vscodeWorkspaces = vscode
             newState.chromeTabs = chrome
@@ -710,6 +711,7 @@ struct ClaudeSessionsView: View {
     var body: some View {
         VStack(spacing: 4) {
             ForEach(sessions) { session in
+                let accentColor = session.needsAttention ? Color.retroMagenta : Color.retroAmber
                 HStack {
                     VStack(alignment: .leading, spacing: 2) {
                         HStack(spacing: 6) {
@@ -721,14 +723,25 @@ struct ClaudeSessionsView: View {
                             Text("\(session.processCount) PROC")
                                 .font(.system(.caption2, design: .monospaced))
                                 .fontWeight(.bold)
-                                .foregroundColor(.retroAmber)
+                                .foregroundColor(accentColor)
                                 .padding(.horizontal, 4)
                                 .padding(.vertical, 1)
-                                .background(Color.retroAmber.opacity(0.2))
+                                .background(accentColor.opacity(0.2))
                                 .cornerRadius(2)
+
+                            if session.needsAttention {
+                                Text("HIGH")
+                                    .font(.system(.caption2, design: .monospaced))
+                                    .fontWeight(.bold)
+                                    .foregroundColor(.retroMagenta)
+                            }
                         }
 
-                        Text("PID \(session.pid)")
+                        Text("PID \(session.pid) · \(session.terminal)")
+                            .font(.system(.caption2, design: .monospaced))
+                            .foregroundColor(.retroTextMuted)
+
+                        Text("\(session.helperProcessCount) HELPERS · \(session.nodeProcessCount) NODE · \(session.pythonProcessCount) PY")
                             .font(.system(.caption2, design: .monospaced))
                             .foregroundColor(.retroTextMuted)
                     }
@@ -742,10 +755,10 @@ struct ClaudeSessionsView: View {
                 }
                 .padding(.vertical, 6)
                 .padding(.horizontal, 8)
-                .background(Color.retroSurfaceRaised)
+                .background(session.needsAttention ? Color.retroMagenta.opacity(0.08) : Color.retroSurfaceRaised)
                 .overlay(
                     RoundedRectangle(cornerRadius: 4)
-                        .stroke(Color.retroBorder, lineWidth: 1)
+                        .stroke(session.needsAttention ? Color.retroMagenta.opacity(0.5) : Color.retroBorder, lineWidth: 1)
                 )
                 .cornerRadius(4)
             }

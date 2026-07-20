@@ -81,6 +81,89 @@ public struct ClaudeProcessGroup {
     public var processCount: Int {
         processes.count
     }
+
+    public var helperSummary: ClaudeHelperSummary {
+        let helpers = processes.filter { $0.pid != root.pid }
+        return ClaudeHelperSummary(
+            total: helpers.count,
+            node: helpers.filter { executableBasename($0.command) == "node" }.count,
+            python: helpers.filter { executableBasename($0.command).hasPrefix("python") }.count,
+            claude: helpers.filter { isClaudeCLICommand($0.command) }.count
+        )
+    }
+}
+
+public struct ClaudeHelperSummary {
+    public let total: Int
+    public let node: Int
+    public let python: Int
+    public let claude: Int
+}
+
+public let claudeSessionMemoryWarningThreshold: UInt64 = 3 * 1_073_741_824
+public let claudeSessionProcessWarningThreshold = 40
+
+public func claudeSessionNeedsAttention(memory: UInt64, processCount: Int) -> Bool {
+    memory >= claudeSessionMemoryWarningThreshold || processCount >= claudeSessionProcessWarningThreshold
+}
+
+public struct ClaudeOrphanSummary {
+    public let processIDs: Set<Int32>
+    public let memory: UInt64
+    public let newProcessCount: Int
+
+    public var processCount: Int {
+        processIDs.count
+    }
+}
+
+public struct ClaudeOrphanTracker {
+    private var previousTrees: [Int32: [Int32: String]] = [:]
+    private var orphanedProcesses: [Int32: String] = [:]
+
+    public init() {}
+
+    public mutating func update(
+        processes: [ProcessSnapshot],
+        groups: [ClaudeProcessGroup]
+    ) -> ClaudeOrphanSummary {
+        let activeByPid = Dictionary(uniqueKeysWithValues: processes.filter { $0.pid > 0 }.map { ($0.pid, $0) })
+        let activeProcessIDs = Set(activeByPid.keys)
+        let currentRootIDs = Set(groups.map { $0.root.pid })
+        let currentlyClaimedIDs = Set(groups.flatMap { $0.processes.map(\.pid) })
+        var newlyDetachedProcesses: [Int32: String] = [:]
+
+        for (rootPid, processCommands) in previousTrees where !currentRootIDs.contains(rootPid) {
+            for (pid, command) in processCommands where pid != rootPid {
+                newlyDetachedProcesses[pid] = command
+            }
+        }
+
+        let previousOrphanIDs = Set(orphanedProcesses.keys)
+        orphanedProcesses.merge(newlyDetachedProcesses) { _, new in new }
+        orphanedProcesses = orphanedProcesses.filter { pid, originalCommand in
+            activeProcessIDs.contains(pid) &&
+                !currentlyClaimedIDs.contains(pid) &&
+                activeByPid[pid]?.command == originalCommand
+        }
+
+        previousTrees = Dictionary(uniqueKeysWithValues: groups.map { group in
+            let processCommands = Dictionary(uniqueKeysWithValues: group.processes.map { ($0.pid, $0.command) })
+            return (group.root.pid, processCommands)
+        })
+
+        let orphanedProcessIDs = Set(orphanedProcesses.keys)
+        let memory = orphanedProcessIDs.reduce(UInt64(0)) { total, pid in
+            total + (activeByPid[pid]?.memory ?? 0)
+        }
+        let newProcessCount = orphanedProcessIDs.subtracting(previousOrphanIDs).count
+
+        return ClaudeOrphanSummary(
+            processIDs: orphanedProcessIDs,
+            memory: memory,
+            newProcessCount: newProcessCount
+        )
+    }
 }
 
 /// Result of categorizing processes by app
@@ -103,6 +186,13 @@ public func matchesAppPattern(_ command: String, pattern: String) -> Bool {
     }
 }
 
+private func executableBasename(_ command: String) -> String {
+    guard let executable = command.split(whereSeparator: { $0.isWhitespace }).first else {
+        return ""
+    }
+    return executable.split(separator: "/").last.map { $0.lowercased() } ?? ""
+}
+
 /// Returns true for Claude Code CLI executables without matching Claude Desktop.
 public func isClaudeCLICommand(_ command: String) -> Bool {
     guard let executable = command.split(whereSeparator: { $0.isWhitespace }).first else {
@@ -114,7 +204,7 @@ public func isClaudeCLICommand(_ command: String) -> Bool {
         return false
     }
 
-    let basename = path.split(separator: "/").last.map(String.init) ?? path
+    let basename = executableBasename(command)
     return basename == "claude" || path.contains("/.local/share/claude/versions/")
 }
 

@@ -6,6 +6,8 @@ import Darwin
 class ProcessMonitor {
     static let shared = ProcessMonitor()
 
+    private var claudeOrphanTracker = ClaudeOrphanTracker()
+
     private init() {}
 
     /// Run a shell command and return output
@@ -114,12 +116,16 @@ class ProcessMonitor {
         }
     }
 
-    /// Get Claude Code sessions with project info
-    func getClaudeSessions(from processes: [ProcessInfo]) -> [ClaudeSession] {
+    /// Get Claude Code sessions, helper details, and processes left behind by closed sessions.
+    func getClaudeProcessReport(from processes: [ProcessInfo]) -> ClaudeProcessReport {
+        let snapshots = processes.map(\.snapshot)
+        let groups = groupClaudeProcessTrees(snapshots)
+        let orphanSummary = claudeOrphanTracker.update(processes: snapshots, groups: groups)
         var sessions: [ClaudeSession] = []
 
-        for group in groupClaudeProcessTrees(processes.map(\.snapshot)) {
+        for group in groups {
             let process = group.root
+            let helpers = group.helperSummary
             var workingDir = "Unknown"
             if let lsofOutput = shell("lsof -p \(process.pid) 2>/dev/null | grep cwd | awk '{print $NF}' | head -1") {
                 let dir = lsofOutput.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -135,12 +141,30 @@ class ProcessMonitor {
                 pid: process.pid,
                 projectName: projectName,
                 workingDirectory: workingDir,
+                terminal: process.terminal ?? "??",
                 memory: group.memory,
-                processCount: group.processCount
+                processCount: group.processCount,
+                helperProcessCount: helpers.total,
+                nodeProcessCount: helpers.node,
+                pythonProcessCount: helpers.python
             ))
         }
 
-        return sessions.sorted { $0.memory > $1.memory }
+        let orphanedProcesses = OrphanedClaudeProcesses(
+            processCount: orphanSummary.processCount,
+            memory: orphanSummary.memory
+        )
+        if orphanSummary.newProcessCount > 0 {
+            CrashDetector.shared.sendOrphanedClaudeWarning(
+                processCount: orphanSummary.processCount,
+                memory: orphanSummary.memory
+            )
+        }
+
+        return ClaudeProcessReport(
+            sessions: sessions.sorted { $0.memory > $1.memory },
+            orphanedProcesses: orphanedProcesses
+        )
     }
 
     /// Get Chrome tabs (approximation based on renderer processes)
@@ -283,6 +307,21 @@ class ProcessMonitor {
             diagnostics.append(Diagnostic(
                 message: "\(activeSessions) Claude sessions active",
                 severity: .warning
+            ))
+        }
+
+        if let hotSession = state.claudeSessions.filter(\.needsAttention).max(by: { $0.memory < $1.memory }) {
+            diagnostics.append(Diagnostic(
+                message: "Claude PID \(hotSession.pid) high: \(hotSession.formattedMemory), \(hotSession.processCount) processes",
+                severity: .critical
+            ))
+        }
+
+        let orphaned = state.orphanedClaudeProcesses
+        if orphaned.processCount > 0 {
+            diagnostics.append(Diagnostic(
+                message: "\(orphaned.processCount) orphaned Claude helpers using \(orphaned.formattedMemory)",
+                severity: orphaned.memory >= 1_073_741_824 ? .critical : .warning
             ))
         }
 
