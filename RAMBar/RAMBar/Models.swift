@@ -63,7 +63,7 @@ struct ClaudeSession: Identifiable {
     let projectName: String
     let workingDirectory: String
     let memory: UInt64
-    let isSubagent: Bool
+    let processCount: Int
 
     var memoryMB: Double { Double(memory) / 1_048_576 }
 

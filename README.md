@@ -17,7 +17,7 @@ So I upgraded to a 48GB MacBook Pro, which mostly solved the crashes. But I stil
 - **Menu Bar Icon** - Shows current RAM percentage with color-coded status (green/amber/red)
 - **Quick Popover** - Click to see memory breakdown by app
 - **Expandable Details**:
-  - Claude Code sessions (click to expand, see main vs subagent, memory per session)
+  - Claude Code sessions (click to expand, see each project and its full child-process memory)
   - Chrome tabs (click to expand, see memory per tab)
 - **Click-to-Activate** - Click any app row (Python, VS Code, Slack, etc.) to bring it to foreground
 - **Smart Diagnostics** - Warnings when memory is high or too many Claude sessions active

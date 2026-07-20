@@ -130,7 +130,7 @@ class RAMBarViewModel: ObservableObject {
             // Get system memory (fast, no shell)
             let memory = MemoryMonitor.shared.getSystemMemory()
 
-            // Get process data — single ps aux call, reused across all queries
+            // Get process data once and reuse it across all queries
             let processes = ProcessMonitor.shared.getProcessList()
             let apps = ProcessMonitor.shared.getAppMemory(from: processes)
             let claude = ProcessMonitor.shared.getClaudeSessions(from: processes)
@@ -718,13 +718,13 @@ struct ClaudeSessionsView: View {
                                 .foregroundColor(.retroTextPrimary)
                                 .lineLimit(1)
 
-                            Text(session.isSubagent ? "SUB" : "MAIN")
+                            Text("\(session.processCount) PROC")
                                 .font(.system(.caption2, design: .monospaced))
                                 .fontWeight(.bold)
-                                .foregroundColor(session.isSubagent ? .retroTextMuted : .retroAmber)
+                                .foregroundColor(.retroAmber)
                                 .padding(.horizontal, 4)
                                 .padding(.vertical, 1)
-                                .background(session.isSubagent ? Color.retroTextMuted.opacity(0.2) : Color.retroAmber.opacity(0.2))
+                                .background(Color.retroAmber.opacity(0.2))
                                 .cornerRadius(2)
                         }
 
