@@ -4,7 +4,7 @@ import Foundation
 /// TTY state, which goes stale when terminals close and is absent for
 /// desktop-app and SDK sessions entirely.
 public enum SessionMode: String, Codable, Sendable {
-    case desktop   // an ancestor is the Claude Desktop app
+    case desktop   // an ancestor is the agent's desktop app
     case terminal  // an ancestor is a terminal emulator, tmux, or an editor
     case headless  // reached launchd without either marker (lanes, cron, SDK)
 
@@ -116,7 +116,8 @@ public func buildSessionTrees(_ samples: [ProcessSample]) -> [AgentSessionTree] 
         while child.ppid > 0, visited.insert(child.ppid).inserted,
               let parent = byPid[child.ppid], isPlausibleParent(parent, of: child) {
             let lower = parent.execPath.lowercased()
-            if lower.contains("/applications/claude.app/") { return .desktop }
+            if lower.contains("/applications/claude.app/")
+                || lower.contains("/applications/codex.app/") { return .desktop }
             if isTerminalAncestor((lower as NSString).lastPathComponent) { return .terminal }
             child = parent
         }

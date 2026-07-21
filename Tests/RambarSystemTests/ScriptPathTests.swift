@@ -1,5 +1,6 @@
 import XCTest
 @testable import RambarSystem
+@testable import RambarKit
 
 final class ScriptPathTests: XCTestCase {
     func testFirstNonFlagArgumentWins() {
@@ -23,5 +24,49 @@ final class ScriptPathTests: XCTestCase {
             scriptPath(fromArguments: ["python", "PYTHONHASHSEED=0", "/x/train.py"]),
             "/x/train.py"
         )
+    }
+
+    func testAgentSessionIDHintUsesOnlyKnownResumeForms() {
+        let claudeID = "33333333-3333-4333-8333-333333333333"
+        XCTAssertEqual(
+            agentSessionIDHint(
+                family: .claude,
+                arguments: ["/usr/bin/claude", "--resume", claudeID]
+            ),
+            claudeID
+        )
+
+        let codexID = "019f81d6-f643-7003-b55c-856d51701c9f"
+        XCTAssertEqual(
+            agentSessionIDHint(
+                family: .codex,
+                arguments: ["/usr/bin/codex", "resume", codexID]
+            ),
+            codexID
+        )
+        XCTAssertNil(agentSessionIDHint(
+            family: .codex,
+            arguments: ["/usr/bin/codex", "exec", codexID]
+        ))
+    }
+
+    func testAgentFallbackUsesExecutableArgument() {
+        let codex = "/Users/dev/.npm/@openai/.codex-old/bin/codex"
+        XCTAssertEqual(
+            fallbackAgentExecutablePath(fromArguments: [codex, "exec"]),
+            codex
+        )
+        XCTAssertEqual(
+            fallbackAgentExecutablePath(fromArguments: ["/opt/homebrew/bin/gemini"]),
+            "/opt/homebrew/bin/gemini"
+        )
+    }
+
+    func testAgentFallbackRejectsDesktopUIAndUnrelatedProcesses() {
+        XCTAssertNil(fallbackAgentExecutablePath(fromArguments: []))
+        XCTAssertNil(fallbackAgentExecutablePath(fromArguments: ["/usr/bin/node", "codex.js"]))
+        XCTAssertNil(fallbackAgentExecutablePath(fromArguments: [
+            "/Applications/Claude.app/Contents/MacOS/Claude"
+        ]))
     }
 }

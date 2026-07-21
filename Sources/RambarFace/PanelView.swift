@@ -255,6 +255,8 @@ struct PanelView: View {
                         Text(session.displayName)
                             .font(.system(size: 13, weight: .medium))
                             .lineLimit(1)
+                            .truncationMode(.tail)
+                            .help(session.title ?? session.project)
                         Text(subtitle(for: session))
                             .font(.caption2)
                             .monospacedDigit()

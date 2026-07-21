@@ -12,6 +12,9 @@ public struct ProcessSample: Hashable, Sendable {
     /// from argv[1]; nil otherwise. Lets dedup distinguish two MCP servers
     /// that are both "node" at the binary level.
     public let scriptPath: String?
+    /// A session ID exposed explicitly by a supported agent resume command.
+    /// This is only a hint; SessionIndex validates it against local metadata.
+    public let sessionIDHint: String?
     public let cwd: String?
     /// Physical footprint in bytes (ri_phys_footprint), the same per-process
     /// attribution Activity Monitor's Memory column reports.
@@ -25,6 +28,7 @@ public struct ProcessSample: Hashable, Sendable {
         ppid: Int32,
         execPath: String,
         scriptPath: String? = nil,
+        sessionIDHint: String? = nil,
         cwd: String? = nil,
         footprint: UInt64 = 0,
         startTime: Double = 0
@@ -33,6 +37,7 @@ public struct ProcessSample: Hashable, Sendable {
         self.ppid = ppid
         self.execPath = execPath
         self.scriptPath = scriptPath
+        self.sessionIDHint = sessionIDHint
         self.cwd = cwd
         self.footprint = footprint
         self.startTime = startTime

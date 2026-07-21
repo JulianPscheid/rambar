@@ -23,6 +23,7 @@ public final class Daemon {
 
     private var tracker = OrphanTracker()
     private var identityCache: [String: Store.SessionIdentity] = [:]
+    private var identityRetryAfter: [String: Double] = [:]
     private var timer: DispatchSourceTimer?
     private var pressureWatcher: PressureWatcher?
     private var lastPressure: PressureLevel = .normal
@@ -71,32 +72,39 @@ public final class Daemon {
         let orphanReport = tracker.update(samples: samples, trees: trees)
 
         var identities: [String: Store.SessionIdentity] = [:]
-        let unambiguous = keysWithUnambiguousCwd(trees)
+        let lookupTrees = trees.filter { tree in
+            guard identityCache[tree.key]?.title == nil else { return false }
+            return identityCache[tree.key]?.sessionID != nil
+                || now >= identityRetryAfter[tree.key, default: 0]
+        }
+        let knownSessionIDs = Dictionary(uniqueKeysWithValues: lookupTrees.compactMap { tree in
+            identityCache[tree.key]?.sessionID.map { (tree.key, $0) }
+        })
+        let resolved = index.identities(
+            for: lookupTrees,
+            knownSessionIDs: knownSessionIDs
+        )
         for tree in trees {
-            guard unambiguous.contains(tree.key) else {
-                identities[tree.key] = Store.SessionIdentity(
-                    sessionID: nil, title: nil, ambiguous: true
-                )
-                identityCache.removeValue(forKey: tree.key)
-                continue
-            }
-            if let cached = identityCache[tree.key] {
-                identities[tree.key] = cached
-                continue
-            }
-            if let id = index.sessionID(
-                family: tree.family, cwd: tree.root.cwd, rootStart: tree.root.startTime
-            ) {
+            if let indexed = resolved[tree.key] {
                 let identity = Store.SessionIdentity(
-                    sessionID: id,
-                    title: index.title(family: tree.family, cwd: tree.root.cwd, sessionID: id),
+                    sessionID: indexed.sessionID,
+                    title: indexed.title,
                     ambiguous: false
                 )
                 identities[tree.key] = identity
                 identityCache[tree.key] = identity
+                identityRetryAfter.removeValue(forKey: tree.key)
+            } else if let cached = identityCache[tree.key] {
+                identities[tree.key] = cached
             }
         }
+        for tree in lookupTrees where resolved[tree.key] == nil {
+            identityRetryAfter[tree.key] = now + 30
+        }
         identityCache = identityCache.filter { key, _ in
+            trees.contains { $0.key == key }
+        }
+        identityRetryAfter = identityRetryAfter.filter { key, _ in
             trees.contains { $0.key == key }
         }
 
