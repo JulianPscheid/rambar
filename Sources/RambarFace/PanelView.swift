@@ -327,7 +327,10 @@ struct PanelView: View {
                 }
             }
             if let dups = model.orphans?.duplicates, !dups.isEmpty {
-                ForEach(dups, id: \.basename) { dup in
+                let named = dups.filter {
+                    !$0.basename.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                }
+                ForEach(Array(named.prefix(3)), id: \.basename) { dup in
                     Label {
                         Text("\(dup.basename) ×\(dup.count) · \(formatBytes(dup.footprint))")
                             .monospacedDigit()
@@ -338,6 +341,11 @@ struct PanelView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .help("The same helper is resident \(dup.count) times across sessions")
+                }
+                if named.count > 3 {
+                    Text("… and \(named.count - 3) more duplicate helper groups")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
                 }
             }
         }
