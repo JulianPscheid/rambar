@@ -137,6 +137,54 @@ func agentSessionIDHint(family: AgentFamily, arguments: [String]) -> String? {
     return nil
 }
 
+struct AgentProcessMetadata: Equatable, Sendable {
+    let ownerPID: Int32?
+    let isInfrastructure: Bool
+
+    static let none = AgentProcessMetadata(ownerPID: nil, isInfrastructure: false)
+}
+
+/// Parse only agent-owned process forms observed in the live CLI. A detached
+/// Claude daemon carries a JSON `--spawned-by` record pointing back to its
+/// chat root; a background spare is shared infrastructure with no chat yet.
+func agentProcessMetadata(
+    family: AgentFamily,
+    arguments: [String]
+) -> AgentProcessMetadata {
+    guard family == .claude else { return .none }
+
+    let isDaemon = arguments.count >= 3
+        && arguments[1] == "daemon"
+        && arguments[2] == "run"
+    let isSpare = arguments.contains("--bg-spare")
+    guard isDaemon || isSpare else { return .none }
+
+    var spawnedBy: String?
+    for (index, argument) in arguments.enumerated() {
+        if argument == "--spawned-by", arguments.indices.contains(index + 1) {
+            spawnedBy = arguments[index + 1]
+            break
+        }
+        let prefix = "--spawned-by="
+        if argument.hasPrefix(prefix) {
+            spawnedBy = String(argument.dropFirst(prefix.count))
+            break
+        }
+    }
+
+    var ownerPID: Int32?
+    if isDaemon, let spawnedBy, let data = spawnedBy.data(using: .utf8),
+       let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+       payload["label"] as? String == "claude",
+       let number = payload["pid"] as? NSNumber {
+        let value = number.int64Value
+        if value > 0 && value <= Int64(Int32.max) {
+            ownerPID = Int32(value)
+        }
+    }
+    return AgentProcessMetadata(ownerPID: ownerPID, isInfrastructure: true)
+}
+
 /// Recover an agent executable identity from argv[0] when proc_pidpath no
 /// longer resolves it, such as a CLI left running across an npm upgrade.
 /// Reuse the normal classifier so app UI and unrelated processes stay out.
@@ -170,6 +218,9 @@ public func collectProcessSamples() -> [ProcessSample] {
         let sessionIDHint = family.flatMap { family in
             arguments.flatMap { agentSessionIDHint(family: family, arguments: $0) }
         }
+        let agentMetadata = family.flatMap { family in
+            arguments.map { agentProcessMetadata(family: family, arguments: $0) }
+        } ?? .none
 
         samples.append(ProcessSample(
             pid: pid,
@@ -177,6 +228,8 @@ public func collectProcessSamples() -> [ProcessSample] {
             execPath: execPath,
             scriptPath: script,
             sessionIDHint: sessionIDHint,
+            agentOwnerPID: agentMetadata.ownerPID,
+            isAgentInfrastructure: agentMetadata.isInfrastructure,
             cwd: Proc.workingDirectory(pid),
             footprint: Proc.physicalFootprint(pid) ?? 0,
             startTime: info.startTime

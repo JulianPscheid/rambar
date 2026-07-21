@@ -183,9 +183,9 @@ struct PanelView: View {
     private func hostRow(_ group: ProcessGroup) -> some View {
         HStack(alignment: .center) {
             VStack(alignment: .leading, spacing: 1) {
-                Text("desktop host")
+                Text("shared background")
                     .font(.system(size: 13, weight: .medium))
-                Text("\(group.hostProcessCount) procs outside session trees")
+                Text("\(group.hostProcessCount) procs outside chat trees")
                     .font(.caption2)
                     .monospacedDigit()
                     .foregroundStyle(.secondary)
@@ -291,6 +291,17 @@ struct PanelView: View {
 
             if expanded {
                 VStack(alignment: .leading, spacing: 3) {
+                    if let id = session.sessionID {
+                        HStack(alignment: .firstTextBaseline, spacing: 6) {
+                            Text("session ID")
+                                .foregroundStyle(.tertiary)
+                            Text(id)
+                                .monospaced()
+                                .textSelection(.enabled)
+                        }
+                        .font(.caption2)
+                        .padding(.bottom, 2)
+                    }
                     ForEach(model.expandedChildren, id: \.pid) { child in
                         HStack {
                             Text(child.commandLabel)

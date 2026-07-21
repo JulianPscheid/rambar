@@ -79,6 +79,34 @@ final class ProcessGroupTests: XCTestCase {
         XCTAssertEqual(claude.footprint, 600 * 1_048_576)
     }
 
+    func testAgentInfrastructureCountsAsSharedOverheadNotSessions() throws {
+        let samples = [
+            Fixture.process(1, 0, Fixture.launchd, start: 0),
+            Fixture.process(10, 1, Fixture.cliEngine, cwd: "/Users/dev/project", mb: 100, start: 100),
+            Fixture.process(
+                20, 1, Fixture.cliEngine, cwd: Fixture.home, mb: 200, start: 110,
+                agentOwnerPID: 10, isAgentInfrastructure: true
+            ),
+            Fixture.process(21, 20, Fixture.node, mb: 300, start: 120),
+            Fixture.process(
+                30, 1, Fixture.cliEngine, cwd: "/tmp/spare", mb: 400, start: 130,
+                isAgentInfrastructure: true
+            ),
+            Fixture.process(31, 30, Fixture.node, mb: 500, start: 140),
+        ]
+
+        let trees = buildSessionTrees(samples)
+        let claude = try XCTUnwrap(
+            buildProcessGroups(samples: samples, sessionTrees: trees).first { $0.family == .claude }
+        )
+
+        XCTAssertEqual(claude.sessionCount, 1)
+        XCTAssertEqual(claude.processCount, 5)
+        XCTAssertEqual(claude.footprint, 1_500 * 1_048_576)
+        XCTAssertEqual(claude.hostProcessCount, 2)
+        XCTAssertEqual(claude.hostFootprint, 900 * 1_048_576)
+    }
+
     func testOtherAppearsOnlyWhenUnmatchedFootprintCrossesThreshold() {
         let small = [Fixture.process(10, 1, "/usr/libexec/unmatched", mb: 499)]
         XCTAssertTrue(buildProcessGroups(samples: small, sessionTrees: []).isEmpty)

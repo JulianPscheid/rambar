@@ -18,8 +18,8 @@ public struct ProcessGroup: Hashable, Codable, Sendable {
     public let footprint: UInt64
     public let processCount: Int
     public let sessionCount: Int
-    /// Agent desktop-app processes that host, but are not descendants of,
-    /// the engine sessions represented by this group.
+    /// Shared agent infrastructure outside conversation trees: desktop host
+    /// processes, detached daemons without a live owner, and spare workers.
     public let hostFootprint: UInt64
     public let hostProcessCount: Int
 
@@ -140,6 +140,42 @@ private func hostFamily(for lowerPath: String) -> AgentFamily? {
     return nil
 }
 
+/// Attribute each infrastructure root and its real OS descendants to an
+/// agent family. Session-tree ownership takes precedence later, so a daemon
+/// with a live `--spawned-by` owner is charged to that conversation instead.
+private func infrastructureFamilies(
+    in samples: [ProcessSample]
+) -> [Int32: AgentFamily] {
+    var byPid: [Int32: ProcessSample] = [:]
+    for sample in samples where sample.pid > 0 {
+        byPid[sample.pid] = byPid[sample.pid] ?? sample
+    }
+    let rootFamilies: [Int32: AgentFamily] = Dictionary(
+        uniqueKeysWithValues: byPid.values.compactMap { sample in
+            guard sample.isAgentInfrastructure,
+                  let family = agentFamily(forExecutablePath: sample.execPath) else { return nil }
+            return (sample.pid, family)
+        }
+    )
+
+    var result: [Int32: AgentFamily] = [:]
+    for sample in byPid.values {
+        var current = sample
+        var visited: Set<Int32> = []
+        while visited.insert(current.pid).inserted {
+            if let family = rootFamilies[current.pid] {
+                result[sample.pid] = family
+                break
+            }
+            guard current.ppid > 0,
+                  let parent = byPid[current.ppid],
+                  parent.startTime <= current.startTime else { break }
+            current = parent
+        }
+    }
+    return result
+}
+
 private let appAliases: [String: (key: String, displayName: String)] = [
     "brave browser": ("brave", "Brave"),
     "google chrome": ("chrome", "Chrome"),
@@ -190,6 +226,9 @@ public func buildProcessGroups(
             ownedFamilyByPid[member.pid] = ownedFamilyByPid[member.pid] ?? tree.family
         }
     }
+    let infrastructureFamilyByPid = infrastructureFamilies(in: Array(uniqueSamples.values))
+    let activeAgentFamilies = Set(sessionCountByFamily.keys)
+        .union(infrastructureFamilyByPid.values)
 
     var identities: [String: GroupIdentity] = [:]
     var footprints: [String: UInt64] = [:]
@@ -207,8 +246,11 @@ public func buildProcessGroups(
 
         if let family = ownedFamilyByPid[sample.pid] {
             groupIdentity = identity(for: family)
+        } else if let family = infrastructureFamilyByPid[sample.pid] {
+            groupIdentity = identity(for: family)
+            isHostProcess = true
         } else if let family = hostFamily(for: lowerPath) {
-            if sessionCountByFamily[family, default: 0] > 0 {
+            if activeAgentFamilies.contains(family) {
                 groupIdentity = identity(for: family)
                 isHostProcess = true
             } else {

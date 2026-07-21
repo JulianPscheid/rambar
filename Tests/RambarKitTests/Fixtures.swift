@@ -27,13 +27,17 @@ enum Fixture {
         script: String? = nil,
         cwd: String? = nil,
         mb footprintMB: UInt64 = 10,
-        start: Double = 1_000
+        start: Double = 1_000,
+        agentOwnerPID: Int32? = nil,
+        isAgentInfrastructure: Bool = false
     ) -> ProcessSample {
         ProcessSample(
             pid: pid,
             ppid: ppid,
             execPath: execPath,
             scriptPath: script,
+            agentOwnerPID: agentOwnerPID,
+            isAgentInfrastructure: isAgentInfrastructure,
             cwd: cwd,
             footprint: footprintMB * 1_048_576,
             startTime: start
