@@ -1,5 +1,4 @@
 import Foundation
-import AppKit
 import Darwin
 
 /// Monitors running processes and categorizes memory usage
@@ -7,6 +6,8 @@ class ProcessMonitor {
     static let shared = ProcessMonitor()
 
     private var claudeOrphanTracker = ClaudeOrphanTracker()
+    private var latestClaudeOrphanIDs: Set<Int32> = []
+    private let claudeOrphanTrackerLock = NSLock()
 
     private init() {}
 
@@ -109,6 +110,48 @@ class ProcessMonitor {
         }
     }
 
+    /// Read only process ownership metadata for the always-on orphan watchdog.
+    /// This avoids collecting a physical footprint for every process while the
+    /// popover is closed.
+    func getProcessTopology() -> [ProcessInfo] {
+        guard let output = shell("ps -axww -o pid=,ppid=,tty=,command=") else {
+            print("Failed to read process topology")
+            return []
+        }
+
+        return parseProcessTopology(output).map {
+            ProcessInfo(
+                pid: $0.pid,
+                parentPid: $0.parentPid,
+                terminal: $0.terminal ?? "??",
+                command: $0.command,
+                memory: 0
+            )
+        }
+    }
+
+    /// Advance orphan detection from the cheap topology scan. This is the only
+    /// call that mutates the tracker, keeping its two-observation grace period
+    /// tied to the watchdog cadence.
+    func scanClaudeOrphans(from processes: [ProcessInfo]) -> ClaudeOrphanSummary {
+        let snapshots = processes.map(\.snapshot)
+        let groups = groupClaudeProcessTrees(snapshots)
+
+        claudeOrphanTrackerLock.lock()
+        defer { claudeOrphanTrackerLock.unlock() }
+        let summary = claudeOrphanTracker.update(processes: snapshots, groups: groups)
+        latestClaudeOrphanIDs = summary.processIDs
+        return summary
+    }
+
+    /// Collect physical footprint only for the small set of processes that the
+    /// watchdog is about to report.
+    func physicalMemoryUsage(for processIDs: Set<Int32>) -> UInt64 {
+        processIDs.reduce(UInt64(0)) { total, pid in
+            total + (physicalFootprint(for: pid) ?? 0)
+        }
+    }
+
     /// Get memory usage grouped by app.
     func getAppMemory(from processes: [ProcessInfo]) -> [AppMemory] {
         categorizeProcesses(processes.map(\.snapshot), patterns: defaultAppPatterns).map {
@@ -120,7 +163,6 @@ class ProcessMonitor {
     func getClaudeProcessReport(from processes: [ProcessInfo]) -> ClaudeProcessReport {
         let snapshots = processes.map(\.snapshot)
         let groups = groupClaudeProcessTrees(snapshots)
-        let orphanSummary = claudeOrphanTracker.update(processes: snapshots, groups: groups)
         let workingDirectories = getWorkingDirectories(for: groups.map { $0.root.pid })
         var sessions: [ClaudeSession] = []
 
@@ -145,16 +187,18 @@ class ProcessMonitor {
             ))
         }
 
-        let orphanedProcesses = OrphanedClaudeProcesses(
-            processCount: orphanSummary.processCount,
-            memory: orphanSummary.memory
-        )
-        if orphanSummary.newProcessCount > 0 {
-            CrashDetector.shared.sendOrphanedClaudeWarning(
-                processCount: orphanSummary.processCount,
-                memory: orphanSummary.memory
-            )
+        claudeOrphanTrackerLock.lock()
+        let orphanProcessIDs = latestClaudeOrphanIDs
+        claudeOrphanTrackerLock.unlock()
+        let processByPid = Dictionary(uniqueKeysWithValues: processes.map { ($0.pid, $0) })
+        let activeOrphanProcessIDs = orphanProcessIDs.intersection(processByPid.keys)
+        let orphanMemory = activeOrphanProcessIDs.reduce(UInt64(0)) { total, pid in
+            total + (processByPid[pid]?.memory ?? 0)
         }
+        let orphanedProcesses = OrphanedClaudeProcesses(
+            processCount: activeOrphanProcessIDs.count,
+            memory: orphanMemory
+        )
 
         return ClaudeProcessReport(
             sessions: sessions.sorted { $0.memory > $1.memory },
@@ -170,32 +214,40 @@ class ProcessMonitor {
         return parseWorkingDirectories(output)
     }
 
-    /// Get Chrome tabs (approximation based on renderer processes)
-    func getChromeTabs(from processes: [ProcessInfo]) -> [ChromeTab] {
+    /// Get Chrome tab titles and the actual tab count. Memory remains an
+    /// approximation because Chrome does not expose a tab-to-renderer mapping.
+    func getChromeTabReport(from processes: [ProcessInfo]) -> ChromeTabReport {
         let renderers = processes.filter {
             $0.command.contains("Google Chrome Helper (Renderer)")
         }.sorted { $0.memory > $1.memory }
-        guard !renderers.isEmpty else { return [] }
+        guard !renderers.isEmpty else { return ChromeTabReport(tabs: [], tabCount: 0) }
 
         // Get actual tab titles via AppleScript
         var tabTitles: [String] = []
+        var tabCount: Int?
 
         if let output = shell("""
             osascript -e 'tell application "Google Chrome"
                 set tabList to ""
+                set tabCount to 0
                 try
                     repeat with w from 1 to (count of windows)
                         repeat with t from 1 to (count of tabs of window w)
                             set tabTitle to title of tab t of window w
                             set tabList to tabList & tabTitle & "\\n"
+                            set tabCount to tabCount + 1
                         end repeat
                     end repeat
                 end try
-                return tabList
+                return "__RAMBAR_TAB_COUNT__" & tabCount & "\\n" & tabList
             end tell' 2>/dev/null
             """) {
             let lines = output.components(separatedBy: "\n")
-            for line in lines where !line.isEmpty {
+            if let firstLine = lines.first,
+               firstLine.hasPrefix("__RAMBAR_TAB_COUNT__") {
+                tabCount = Int(firstLine.dropFirst("__RAMBAR_TAB_COUNT__".count))
+            }
+            for line in lines.dropFirst() where !line.isEmpty {
                 tabTitles.append(line)
             }
         }
@@ -215,13 +267,7 @@ class ProcessMonitor {
             ))
         }
 
-        return tabs
-    }
-
-    func getChromeRendererCount(from processes: [ProcessInfo]) -> Int {
-        processes.count {
-            $0.command.contains("Google Chrome Helper (Renderer)")
-        }
+        return ChromeTabReport(tabs: tabs, tabCount: tabCount)
     }
 
     /// Get Python processes

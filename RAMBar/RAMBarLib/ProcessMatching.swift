@@ -69,6 +69,31 @@ public func parseProcessList(
     }
 }
 
+/// Parses the cheaper topology-only output from
+/// `ps -axww -o pid=,ppid=,tty=,command=`.
+public func parseProcessTopology(_ output: String) -> [ProcessSnapshot] {
+    output.components(separatedBy: "\n").compactMap { line in
+        let parts = line.split(
+            maxSplits: 3,
+            omittingEmptySubsequences: true,
+            whereSeparator: { $0.isWhitespace }
+        )
+        guard parts.count == 4,
+              let pid = Int32(parts[0]),
+              let parentPid = Int32(parts[1]) else {
+            return nil
+        }
+
+        return ProcessSnapshot(
+            pid: pid,
+            parentPid: parentPid,
+            terminal: String(parts[2]),
+            command: String(parts[3]),
+            memory: 0
+        )
+    }
+}
+
 /// Parses `lsof -a -d cwd -p <pid-list> -Fn` output into working directories.
 public func parseWorkingDirectories(_ output: String) -> [Int32: String] {
     var currentPid: Int32?
@@ -138,7 +163,13 @@ public struct ClaudeOrphanSummary {
 }
 
 public struct ClaudeOrphanTracker {
-    private var previousTrees: [Int32: [Int32: String]] = [:]
+    private struct Candidate {
+        let command: String
+        var observationCount: Int
+    }
+
+    private var previousClaimedChildren: [Int32: String] = [:]
+    private var candidates: [Int32: Candidate] = [:]
     private var orphanedProcesses: [Int32: String] = [:]
 
     public init() {}
@@ -148,40 +179,58 @@ public struct ClaudeOrphanTracker {
         groups: [ClaudeProcessGroup]
     ) -> ClaudeOrphanSummary {
         let activeByPid = Dictionary(uniqueKeysWithValues: processes.filter { $0.pid > 0 }.map { ($0.pid, $0) })
-        let activeProcessIDs = Set(activeByPid.keys)
-        let currentRootIDs = Set(groups.map { $0.root.pid })
-        let currentlyClaimedIDs = Set(groups.flatMap { $0.processes.map(\.pid) })
-        var newlyDetachedProcesses: [Int32: String] = [:]
+        let currentlyClaimed = Dictionary(uniqueKeysWithValues: groups.flatMap { group in
+            group.processes.map { ($0.pid, $0.command) }
+        })
+        let currentlyClaimedChildren = Dictionary(uniqueKeysWithValues: groups.flatMap { group in
+            group.processes.compactMap { process in
+                process.pid == group.root.pid ? nil : (process.pid, process.command)
+            }
+        })
 
-        for (rootPid, processCommands) in previousTrees where !currentRootIDs.contains(rootPid) {
-            for (pid, command) in processCommands where pid != rootPid {
-                newlyDetachedProcesses[pid] = command
+        func isStillDetached(pid: Int32, command: String) -> Bool {
+            activeByPid[pid]?.command == command && currentlyClaimed[pid] == nil
+        }
+
+        orphanedProcesses = orphanedProcesses.filter { pid, originalCommand in
+            isStillDetached(pid: pid, command: originalCommand)
+        }
+        candidates = candidates.filter { pid, candidate in
+            isStillDetached(pid: pid, command: candidate.command)
+        }
+
+        var newlyPromoted = 0
+        for pid in Array(candidates.keys) {
+            guard var candidate = candidates[pid] else { continue }
+            candidate.observationCount += 1
+            if candidate.observationCount >= 2 {
+                orphanedProcesses[pid] = candidate.command
+                candidates.removeValue(forKey: pid)
+                newlyPromoted += 1
+            } else {
+                candidates[pid] = candidate
             }
         }
 
-        let previousOrphanIDs = Set(orphanedProcesses.keys)
-        orphanedProcesses.merge(newlyDetachedProcesses) { _, new in new }
-        orphanedProcesses = orphanedProcesses.filter { pid, originalCommand in
-            activeProcessIDs.contains(pid) &&
-                !currentlyClaimedIDs.contains(pid) &&
-                activeByPid[pid]?.command == originalCommand
+        for (pid, command) in previousClaimedChildren
+        where currentlyClaimedChildren[pid] == nil &&
+            isStillDetached(pid: pid, command: command) &&
+            orphanedProcesses[pid] == nil &&
+            candidates[pid] == nil {
+            candidates[pid] = Candidate(command: command, observationCount: 1)
         }
 
-        previousTrees = Dictionary(uniqueKeysWithValues: groups.map { group in
-            let processCommands = Dictionary(uniqueKeysWithValues: group.processes.map { ($0.pid, $0.command) })
-            return (group.root.pid, processCommands)
-        })
+        previousClaimedChildren = currentlyClaimedChildren
 
         let orphanedProcessIDs = Set(orphanedProcesses.keys)
         let memory = orphanedProcessIDs.reduce(UInt64(0)) { total, pid in
             total + (activeByPid[pid]?.memory ?? 0)
         }
-        let newProcessCount = orphanedProcessIDs.subtracting(previousOrphanIDs).count
 
         return ClaudeOrphanSummary(
             processIDs: orphanedProcessIDs,
             memory: memory,
-            newProcessCount: newProcessCount
+            newProcessCount: newlyPromoted
         )
     }
 }

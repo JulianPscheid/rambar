@@ -3,7 +3,8 @@ import AppKit
 import UserNotifications
 
 /// Monitors for app crashes, specifically VSCode
-class CrashDetector: ObservableObject {
+@MainActor
+final class CrashDetector: ObservableObject {
     static let shared = CrashDetector()
 
     @Published var vscodeRunning = true
@@ -30,7 +31,9 @@ class CrashDetector: ObservableObject {
             object: nil,
             queue: .main
         ) { [weak self] notification in
-            self?.handleAppLaunch(notification)
+            Task { @MainActor in
+                self?.handleAppLaunch(notification)
+            }
         }
         observers.append(launchObserver)
 
@@ -40,7 +43,9 @@ class CrashDetector: ObservableObject {
             object: nil,
             queue: .main
         ) { [weak self] notification in
-            self?.handleAppTerminate(notification)
+            Task { @MainActor in
+                self?.handleAppTerminate(notification)
+            }
         }
         observers.append(terminateObserver)
 

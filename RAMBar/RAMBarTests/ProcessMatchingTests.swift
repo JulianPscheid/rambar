@@ -56,6 +56,24 @@ final class ProcessMatchingTests: XCTestCase {
         XCTAssertEqual(parseWorkingDirectories(output), [400: "/valid/path"])
     }
 
+    func testParseProcessTopologyDoesNotRequireMemoryColumns() {
+        let output = """
+          100    10 ttys001 claude --resume session-id
+          101   100       ?? /opt/homebrew/bin/node mcp-server.js
+        malformed row
+        """
+
+        let processes = parseProcessTopology(output)
+
+        XCTAssertEqual(processes.count, 2)
+        XCTAssertEqual(processes[0].pid, 100)
+        XCTAssertEqual(processes[0].parentPid, 10)
+        XCTAssertEqual(processes[0].terminal, "ttys001")
+        XCTAssertEqual(processes[0].command, "claude --resume session-id")
+        XCTAssertEqual(processes[0].memory, 0)
+        XCTAssertEqual(processes[1].command, "/opt/homebrew/bin/node mcp-server.js")
+    }
+
     // MARK: - Pattern matching
 
     func testClaudeCliMatchesClaude() {
@@ -250,7 +268,7 @@ final class ProcessMatchingTests: XCTestCase {
         XCTAssertTrue(claudeSessionNeedsAttention(memory: 1_000_000_000, processCount: 40))
     }
 
-    func testClaudeOrphanTrackerReportsSurvivingHelpersOnceAndClearsThem() throws {
+    func testClaudeOrphanTrackerReportsPersistentHelpersAfterGracePeriod() throws {
         let initialProcesses: [ProcessSnapshot] = [
             ProcessSnapshot(pid: 100, parentPid: 10, terminal: "ttys001", command: "claude", memory: 500_000_000),
             ProcessSnapshot(pid: 101, parentPid: 100, command: "npm exec mcp-server", memory: 100_000_000),
@@ -266,6 +284,10 @@ final class ProcessMatchingTests: XCTestCase {
             ProcessSnapshot(pid: 101, parentPid: 1, command: "npm exec mcp-server", memory: 100_000_000),
             ProcessSnapshot(pid: 102, parentPid: 101, command: "/opt/homebrew/bin/node mcp-server.js", memory: 200_000_000),
         ]
+        let candidate = tracker.update(processes: survivingHelpers, groups: [])
+        XCTAssertEqual(candidate.processCount, 0, "First detached observation should be a grace period")
+        XCTAssertEqual(candidate.newProcessCount, 0)
+
         let detected = tracker.update(processes: survivingHelpers, groups: [])
         XCTAssertEqual(detected.processCount, 2)
         XCTAssertEqual(detected.memory, 300_000_000)
@@ -278,6 +300,46 @@ final class ProcessMatchingTests: XCTestCase {
         let cleared = tracker.update(processes: [], groups: [])
         XCTAssertEqual(cleared.processCount, 0)
         XCTAssertEqual(cleared.memory, 0)
+    }
+
+    func testClaudeOrphanTrackerDropsHelperThatExitsDuringGracePeriod() throws {
+        let initialProcesses: [ProcessSnapshot] = [
+            ProcessSnapshot(pid: 100, parentPid: 10, terminal: "ttys001", command: "claude", memory: 500_000_000),
+            ProcessSnapshot(pid: 101, parentPid: 100, command: "/opt/homebrew/bin/node mcp-server.js", memory: 200_000_000),
+        ]
+        let initialGroup = try XCTUnwrap(groupClaudeProcessTrees(initialProcesses).first)
+        var tracker = ClaudeOrphanTracker()
+        _ = tracker.update(processes: initialProcesses, groups: [initialGroup])
+
+        let shuttingDown = [
+            ProcessSnapshot(pid: 101, parentPid: 1, command: "/opt/homebrew/bin/node mcp-server.js", memory: 200_000_000),
+        ]
+        XCTAssertEqual(tracker.update(processes: shuttingDown, groups: []).processCount, 0)
+
+        let exited = tracker.update(processes: [], groups: [])
+        XCTAssertEqual(exited.processCount, 0)
+        XCTAssertEqual(exited.newProcessCount, 0)
+    }
+
+    func testClaudeOrphanTrackerDetectsChildDetachedWhileRootRemainsActive() throws {
+        let initialProcesses: [ProcessSnapshot] = [
+            ProcessSnapshot(pid: 100, parentPid: 10, terminal: "ttys001", command: "claude", memory: 500_000_000),
+            ProcessSnapshot(pid: 101, parentPid: 100, command: "/opt/homebrew/bin/node mcp-server.js", memory: 200_000_000),
+        ]
+        let initialGroup = try XCTUnwrap(groupClaudeProcessTrees(initialProcesses).first)
+        var tracker = ClaudeOrphanTracker()
+        _ = tracker.update(processes: initialProcesses, groups: [initialGroup])
+
+        let detachedProcesses: [ProcessSnapshot] = [
+            initialProcesses[0],
+            ProcessSnapshot(pid: 101, parentPid: 1, command: "/opt/homebrew/bin/node mcp-server.js", memory: 200_000_000),
+        ]
+        let detachedGroup = try XCTUnwrap(groupClaudeProcessTrees(detachedProcesses).first)
+        XCTAssertEqual(tracker.update(processes: detachedProcesses, groups: [detachedGroup]).processCount, 0)
+
+        let detected = tracker.update(processes: detachedProcesses, groups: [detachedGroup])
+        XCTAssertEqual(detected.processIDs, Set([101]))
+        XCTAssertEqual(detected.newProcessCount, 1)
     }
 
     func testClaudeOrphanTrackerIgnoresReusedProcessIDs() throws {

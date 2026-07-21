@@ -118,6 +118,11 @@ struct ChromeTab: Identifiable {
     }
 }
 
+struct ChromeTabReport {
+    let tabs: [ChromeTab]
+    let tabCount: Int?
+}
+
 struct PythonProcess: Identifiable {
     let pid: Int32
     let script: String
@@ -173,7 +178,8 @@ struct RAMBarState {
     var claudeSessions: [ClaudeSession] = []
     var orphanedClaudeProcesses: OrphanedClaudeProcesses = .empty
     var chromeTabs: [ChromeTab] = []
-    var chromeTabCount: Int = 0
+    var chromeRendererCount: Int = 0
+    var chromeTabCount: Int?
     var pythonProcesses: [PythonProcess] = []
     var vscodeWorkspaces: [VSCodeWorkspace] = []
     var diagnostics: [Diagnostic] = []

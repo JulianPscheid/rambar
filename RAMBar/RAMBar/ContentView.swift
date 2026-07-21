@@ -22,11 +22,7 @@ extension Color {
 }
 
 struct ContentView: View {
-    @StateObject private var viewModel = RAMBarViewModel()
-
-    func setPopoverVisible(_ visible: Bool) {
-        viewModel.setPopoverVisible(visible)
-    }
+    @ObservedObject var viewModel: RAMBarViewModel
 
     var body: some View {
         VStack(spacing: 0) {
@@ -62,9 +58,10 @@ struct ContentView: View {
                             apps: viewModel.state.apps,
                             claudeSessions: viewModel.state.claudeSessions,
                             chromeTabs: viewModel.state.chromeTabs,
+                            chromeRendererCount: viewModel.state.chromeRendererCount,
                             chromeTabCount: viewModel.state.chromeTabCount,
                             isLoadingChromeTabs: viewModel.isLoadingChromeTabs,
-                            onChromeExpanded: { viewModel.refreshChromeTabsIfNeeded() }
+                            onChromeExpandedChanged: viewModel.setChromeDetailsExpanded
                         )
 
                         // Compact diagnostics
@@ -90,42 +87,47 @@ struct ContentView: View {
 
 // MARK: - View Model
 
-class RAMBarViewModel: ObservableObject {
+@MainActor
+final class RAMBarViewModel: ObservableObject {
     @Published var state = RAMBarState()
     @Published var isLoading = true
     @Published var isRefreshing = false
     @Published var isLoadingChromeTabs = false
 
-    private var timer: Timer?
     private let refreshQueue = DispatchQueue(label: "com.maxghenis.RAMBar.refresh", qos: .userInitiated)
     private var lastChromeTabsRefresh: Date?
+    private var latestChromeRendererProcesses: [ProcessInfo] = []
     private var refreshInFlight = false
+    private var isPopoverVisible = false
+    private var chromeDetailsExpanded = false
+    private lazy var popoverRefreshController = PopoverRefreshController(
+        interval: 5.0,
+        refresh: { [weak self] in self?.refreshAsync() },
+        schedule: { interval, handler in
+            let timer = Timer(timeInterval: interval, repeats: true) { _ in handler() }
+            RunLoop.main.add(timer, forMode: .common)
+            return { timer.invalidate() }
+        }
+    )
 
     init() {
         // Load full data in background on first open
         refreshAsync()
     }
 
-    deinit {
-        timer?.invalidate()
+    /// Start or stop full process and memory refreshes with the popover.
+    func setPopoverVisible(_ visible: Bool) {
+        isPopoverVisible = visible
+        popoverRefreshController.setActive(visible)
+        if visible && chromeDetailsExpanded {
+            refreshChromeTabsIfNeeded()
+        }
     }
 
-    /// Start/stop the refresh timer based on popover visibility.
-    /// No point polling every 3s when the popover is closed — this is the
-    /// main fix for the "significant energy" warning.
-    func setPopoverVisible(_ visible: Bool) {
-        if visible {
-            // Refresh immediately when opened, then every 5s
-            refreshAsync()
-            guard timer == nil else { return }
-            let t = Timer(timeInterval: 5.0, repeats: true) { [weak self] _ in
-                self?.refreshAsync()
-            }
-            RunLoop.main.add(t, forMode: .common)
-            timer = t
-        } else {
-            timer?.invalidate()
-            timer = nil
+    func setChromeDetailsExpanded(_ expanded: Bool) {
+        chromeDetailsExpanded = expanded
+        if expanded {
+            refreshChromeTabsIfNeeded()
         }
     }
 
@@ -139,7 +141,7 @@ class RAMBarViewModel: ObservableObject {
         refreshQueue.async { [weak self] in
             guard let self else { return }
 
-            let result = autoreleasepool { () -> (state: RAMBarState, usagePercent: Double) in
+            let result = autoreleasepool { () -> (state: RAMBarState, usagePercent: Double, chromeRenderers: [ProcessInfo]) in
                 // Get system memory (fast, no shell)
                 let memory = MemoryMonitor.shared.getSystemMemory()
 
@@ -147,26 +149,33 @@ class RAMBarViewModel: ObservableObject {
                 let processes = ProcessMonitor.shared.getProcessList()
                 let apps = ProcessMonitor.shared.getAppMemory(from: processes)
                 let claude = ProcessMonitor.shared.getClaudeProcessReport(from: processes)
-                let chromeTabCount = ProcessMonitor.shared.getChromeRendererCount(from: processes)
+                let chromeRenderers = processes.filter {
+                    $0.command.contains("Google Chrome Helper (Renderer)")
+                }
 
                 var newState = RAMBarState()
                 newState.systemMemory = memory
                 newState.apps = apps
                 newState.claudeSessions = claude.sessions
                 newState.orphanedClaudeProcesses = claude.orphanedProcesses
-                newState.chromeTabCount = chromeTabCount
+                newState.chromeRendererCount = chromeRenderers.count
                 newState.lastUpdate = Date()
                 newState.diagnostics = ProcessMonitor.shared.generateDiagnostics(state: newState)
-                return (newState, memory.usagePercent)
+                return (newState, memory.usagePercent, chromeRenderers)
             }
 
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 var newState = result.state
+                self.latestChromeRendererProcesses = result.chromeRenderers
 
                 // Preserve independently-loaded Chrome details and append history on the main thread.
-                newState.chromeTabs = newState.chromeTabCount > 0 ? self.state.chromeTabs : []
-                if newState.chromeTabCount == 0 {
+                if newState.chromeRendererCount > 0 {
+                    newState.chromeTabs = self.state.chromeTabs
+                    newState.chromeTabCount = self.state.chromeTabCount
+                } else {
+                    newState.chromeTabs = []
+                    newState.chromeTabCount = nil
                     self.lastChromeTabsRefresh = nil
                 }
 
@@ -178,15 +187,18 @@ class RAMBarViewModel: ObservableObject {
                 self.state = newState
                 self.isLoading = false
                 self.refreshInFlight = false
-                if showProgress {
-                    self.isRefreshing = false
+                self.isRefreshing = false
+                if self.isPopoverVisible && self.chromeDetailsExpanded {
+                    self.refreshChromeTabsIfNeeded()
                 }
             }
         }
     }
 
     func refreshChromeTabsIfNeeded() {
-        guard !isLoadingChromeTabs,
+        guard isPopoverVisible,
+              chromeDetailsExpanded,
+              !isLoadingChromeTabs,
               state.apps.contains(where: { $0.name == "Chrome" }) else { return }
         if let lastChromeTabsRefresh,
            Date().timeIntervalSince(lastChromeTabsRefresh) < 30 {
@@ -194,15 +206,16 @@ class RAMBarViewModel: ObservableObject {
         }
 
         isLoadingChromeTabs = true
+        let chromeRenderers = latestChromeRendererProcesses
         refreshQueue.async { [weak self] in
-            let chromeTabs = autoreleasepool {
-                let processes = ProcessMonitor.shared.getProcessList()
-                return ProcessMonitor.shared.getChromeTabs(from: processes)
+            let report = autoreleasepool {
+                ProcessMonitor.shared.getChromeTabReport(from: chromeRenderers)
             }
 
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
-                self.state.chromeTabs = chromeTabs
+                self.state.chromeTabs = report.tabs
+                self.state.chromeTabCount = report.tabCount
                 self.lastChromeTabsRefresh = Date()
                 self.isLoadingChromeTabs = false
             }
@@ -526,9 +539,10 @@ struct AppsListView: View {
     let apps: [AppMemory]
     let claudeSessions: [ClaudeSession]
     let chromeTabs: [ChromeTab]
-    let chromeTabCount: Int
+    let chromeRendererCount: Int
+    let chromeTabCount: Int?
     let isLoadingChromeTabs: Bool
-    let onChromeExpanded: () -> Void
+    let onChromeExpandedChanged: (Bool) -> Void
 
     // Keep expanded state here so it persists across timer refreshes
     @State private var claudeExpanded = false
@@ -547,10 +561,14 @@ struct AppsListView: View {
                         ClaudeSessionsView(sessions: claudeSessions)
                     }
                 } else if app.name == "Chrome" {
+                    let chromeDetail = ChromeDetailCount(
+                        rendererCount: chromeRendererCount,
+                        tabCount: chromeTabCount
+                    )
                     ExpandableAppRow(
                         app: app,
-                        detailCount: chromeTabCount,
-                        detailLabel: "tabs",
+                        detailCount: chromeDetail.count,
+                        detailLabel: chromeDetail.label,
                         isExpanded: $chromeExpanded
                     ) {
                         if isLoadingChromeTabs {
@@ -577,9 +595,7 @@ struct AppsListView: View {
             }
         }
         .onChange(of: chromeExpanded) { _, isExpanded in
-            if isExpanded {
-                onChromeExpanded()
-            }
+            onChromeExpandedChanged(isExpanded)
         }
     }
 }
@@ -1190,5 +1206,5 @@ extension Color {
 }
 
 #Preview {
-    ContentView()
+    ContentView(viewModel: RAMBarViewModel())
 }
