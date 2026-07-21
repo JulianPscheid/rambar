@@ -11,6 +11,13 @@ final class AgentFamilyTests: XCTestCase {
         XCTAssertEqual(agentFamily(forExecutablePath: "/opt/homebrew/bin/claude"), .claude)
     }
 
+    func testVersionedClaudeExecutableMatchesWithoutClaudeBasename() {
+        XCTAssertEqual(
+            agentFamily(forExecutablePath: "/Users/dev/.local/share/claude/versions/2.1.216"),
+            .claude
+        )
+    }
+
     func testClaudeDesktopUIDoesNotMatch() {
         XCTAssertNil(agentFamily(forExecutablePath: Fixture.claudeDesktopUI))
     }

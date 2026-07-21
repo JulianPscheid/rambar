@@ -10,6 +10,7 @@ import RambarSystem
 @MainActor
 final class FaceModel: ObservableObject {
     @Published var system: SystemRecord?
+    @Published var processGroups: [ProcessGroup] = []
     @Published var sessions: [SessionRecord] = []
     @Published var history: [SystemRecord] = []
     @Published var orphans: Store.OrphanState?
@@ -18,6 +19,7 @@ final class FaceModel: ObservableObject {
     @Published var sampledAgo: Double = .infinity
 
     /// Children shown when a session row expands, sampled on demand.
+    @Published var expandedGroupKey: String?
     @Published var expandedKey: String?
     @Published var expandedChildren: [ProcessSample] = []
 
@@ -68,6 +70,7 @@ final class FaceModel: ObservableObject {
         guard collectorRunning else {
             // Show whatever the store last knew, clearly marked stale by the footer.
             system = latest
+            processGroups = store.activeProcessGroups(now: latest?.ts ?? now)
             sessions = store.activeSessions(now: latest?.ts ?? now)
             history = store.systemHistory(since: now - 3_600)
             orphans = store.latestOrphanState()
@@ -75,6 +78,7 @@ final class FaceModel: ObservableObject {
         }
 
         system = latest
+        processGroups = store.activeProcessGroups(now: now)
         sessions = store.activeSessions(now: now)
         history = store.systemHistory(since: now - 3_600)
         orphans = store.latestOrphanState()
@@ -92,6 +96,19 @@ final class FaceModel: ObservableObject {
     }
 
     // MARK: - Expansion
+
+    func toggleExpansion(_ group: ProcessGroup) {
+        guard group.family != nil else { return }
+        if expandedGroupKey == group.key {
+            expandedGroupKey = nil
+            expandedKey = nil
+            expandedChildren = []
+        } else {
+            expandedGroupKey = group.key
+            expandedKey = nil
+            expandedChildren = []
+        }
+    }
 
     func toggleExpansion(_ session: SessionRecord) {
         if expandedKey == session.key {
@@ -173,13 +190,9 @@ final class FaceModel: ObservableObject {
 
     var pressure: PressureLevel { system?.pressure ?? .normal }
 
-    var attributedTotal: UInt64 { sessions.reduce(0) { $0 + $1.footprint } }
-
-    var familyGroups: [(family: AgentFamily, sessions: [SessionRecord])] {
-        AgentFamily.allCases.compactMap { family in
-            let members = sessions.filter { $0.family == family }
-            return members.isEmpty ? nil : (family, members)
-        }
+    func sessions(for group: ProcessGroup) -> [SessionRecord] {
+        guard let family = group.family else { return [] }
+        return sessions.filter { $0.family == family }
     }
 }
 

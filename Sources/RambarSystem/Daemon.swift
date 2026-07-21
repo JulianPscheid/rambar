@@ -67,6 +67,7 @@ public final class Daemon {
         let now = Date().timeIntervalSince1970
         let samples = collectProcessSamples()
         let trees = buildSessionTrees(samples)
+        let processGroups = buildProcessGroups(samples: samples, sessionTrees: trees)
         let orphanReport = tracker.update(samples: samples, trees: trees)
 
         var identities: [String: Store.SessionIdentity] = [:]
@@ -101,6 +102,7 @@ public final class Daemon {
 
         do {
             try store.record(ts: now, trees: trees, identities: identities, home: home)
+            try store.record(ts: now, processGroups: processGroups)
             try store.recordOrphanState(
                 ts: now, report: orphanReport, duplicates: findDuplicates(in: trees)
             )

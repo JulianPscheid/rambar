@@ -135,6 +135,18 @@ public final class Store {
         try execute("CREATE INDEX IF NOT EXISTS idx_sample_key_ts ON sample(key, ts)")
         try execute("CREATE INDEX IF NOT EXISTS idx_sample_ts ON sample(ts)")
         try execute("""
+            CREATE TABLE IF NOT EXISTS process_group(
+                key TEXT PRIMARY KEY,
+                display_name TEXT NOT NULL,
+                family TEXT,
+                kind TEXT NOT NULL,
+                last_seen REAL NOT NULL,
+                footprint INTEGER NOT NULL,
+                procs INTEGER NOT NULL,
+                sessions INTEGER NOT NULL
+            )
+            """)
+        try execute("""
             CREATE TABLE IF NOT EXISTS system_sample(
                 ts REAL PRIMARY KEY,
                 total INTEGER NOT NULL,
@@ -319,6 +331,40 @@ public final class Store {
             ])
     }
 
+    public func record(ts: Double, processGroups: [ProcessGroup]) throws {
+        try execute("BEGIN")
+        do {
+            for group in processGroups {
+                try execute("""
+                    INSERT INTO process_group(
+                        key, display_name, family, kind, last_seen, footprint, procs, sessions
+                    ) VALUES(?,?,?,?,?,?,?,?)
+                    ON CONFLICT(key) DO UPDATE SET
+                        display_name=excluded.display_name,
+                        family=excluded.family,
+                        kind=excluded.kind,
+                        last_seen=excluded.last_seen,
+                        footprint=excluded.footprint,
+                        procs=excluded.procs,
+                        sessions=excluded.sessions
+                    """, [
+                        .text(group.key),
+                        .text(group.displayName),
+                        .textOrNull(group.family?.rawValue),
+                        .text(group.kind.rawValue),
+                        .real(ts),
+                        .int(Int64(bitPattern: group.footprint)),
+                        .int(Int64(group.processCount)),
+                        .int(Int64(group.sessionCount)),
+                    ])
+            }
+            try execute("COMMIT")
+        } catch {
+            try? execute("ROLLBACK")
+            throw error
+        }
+    }
+
     public struct DuplicateJSON: Codable, Sendable {
         public let basename: String
         public let count: Int
@@ -406,6 +452,7 @@ public final class Store {
                 """, [.real(twoHoursAgo), .real(twoHoursAgo)])
             try execute("DELETE FROM event WHERE ts < ?", [.real(weekAgo)])
             try execute("DELETE FROM session WHERE last_seen < ?", [.real(weekAgo)])
+            try execute("DELETE FROM process_group WHERE last_seen < ?", [.real(weekAgo)])
             try execute("COMMIT")
         } catch {
             try? execute("ROLLBACK")
@@ -442,6 +489,26 @@ public final class Store {
             SELECT \(Self.sessionColumns) FROM session
             WHERE last_seen >= ? ORDER BY footprint DESC
             """, [.real(now - staleAfter)], row: Self.sessionRecord)
+    }
+
+    /// Process groups observed within the staleness window, largest first.
+    public func activeProcessGroups(now: Double, staleAfter: Double = 20) -> [ProcessGroup] {
+        query("""
+            SELECT key, display_name, family, kind, footprint, procs, sessions
+            FROM process_group WHERE last_seen >= ?
+            ORDER BY footprint DESC, display_name ASC
+            """, [.real(now - staleAfter)]) { statement in
+                let family = Self.optionalText(statement, 2).flatMap(AgentFamily.init(rawValue:))
+                return ProcessGroup(
+                    key: Self.text(statement, 0),
+                    displayName: Self.text(statement, 1),
+                    family: family,
+                    kind: ProcessGroupKind(rawValue: Self.text(statement, 3)) ?? .application,
+                    footprint: UInt64(bitPattern: sqlite3_column_int64(statement, 4)),
+                    processCount: Int(sqlite3_column_int64(statement, 5)),
+                    sessionCount: Int(sqlite3_column_int64(statement, 6))
+                )
+            }
     }
 
     public func sessionHistory(key: String, since: Double) -> [(time: Double, bytes: UInt64)] {

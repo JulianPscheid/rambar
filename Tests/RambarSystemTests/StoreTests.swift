@@ -84,6 +84,26 @@ final class StoreTests: XCTestCase {
         XCTAssertEqual(store.activeSessions(now: 1_100).count, 0)
     }
 
+    func testProcessGroupsRoundTripAndBecomeStale() throws {
+        let groups = [
+            ProcessGroup(
+                key: "agent:claude", displayName: "Claude Code", family: .claude,
+                kind: .agent, footprint: 900 * 1_048_576, processCount: 12, sessionCount: 3
+            ),
+            ProcessGroup(
+                key: "app:chrome", displayName: "Chrome", family: nil,
+                kind: .application, footprint: 800 * 1_048_576, processCount: 8, sessionCount: 0
+            ),
+        ]
+        try store.record(ts: 1_000, processGroups: groups)
+
+        let active = store.activeProcessGroups(now: 1_005)
+        XCTAssertEqual(active.map(\.key), ["agent:claude", "app:chrome"])
+        XCTAssertEqual(active[0].family, .claude)
+        XCTAssertEqual(active[0].sessionCount, 3)
+        XCTAssertTrue(store.activeProcessGroups(now: 1_100).isEmpty)
+    }
+
     func testHistoryAndSlope() throws {
         let alpha = tree(pid: 50, project: "alpha", mb: 100)
         for step in 0..<10 {

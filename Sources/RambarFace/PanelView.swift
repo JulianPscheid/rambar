@@ -20,19 +20,19 @@ struct PanelView: View {
 
             Divider()
 
-            if model.sessions.isEmpty {
-                Text("no active agent sessions")
+            if model.processGroups.isEmpty {
+                Text("waiting for process sample")
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 28)
             } else if snapshotMode {
                 VStack(alignment: .leading, spacing: 2) {
-                    ForEach(snapshotGroups, id: \.family) { group in
-                        familySection(group.family, group.sessions)
+                    ForEach(snapshotGroups, id: \.key) { group in
+                        processGroupRow(group)
                     }
-                    if model.sessions.count > snapshotRowLimit {
-                        Text("… and \(model.sessions.count - snapshotRowLimit) more sessions")
+                    if model.processGroups.count > snapshotRowLimit {
+                        Text("… and \(model.processGroups.count - snapshotRowLimit) more groups")
                             .font(.caption2)
                             .foregroundStyle(.tertiary)
                             .padding(.horizontal, 6)
@@ -44,8 +44,8 @@ struct PanelView: View {
             } else {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 2) {
-                        ForEach(model.familyGroups, id: \.family) { group in
-                            familySection(group.family, group.sessions)
+                        ForEach(model.processGroups, id: \.key) { group in
+                            processGroupRow(group)
                         }
                     }
                     .padding(.horizontal, 8)
@@ -101,8 +101,7 @@ struct PanelView: View {
 
             if let system = model.system {
                 Text("compressed \(formatBytes(system.compressed))"
-                    + " · agents \(formatBytes(model.attributedTotal))"
-                    + " across \(model.sessions.count) sessions")
+                    + " · \(model.processGroups.count) process groups")
                     .font(.caption)
                     .monospacedDigit()
                     .foregroundStyle(.secondary)
@@ -126,28 +125,83 @@ struct PanelView: View {
         .help("Kernel memory-pressure level — the signal that matters, not the raw percent")
     }
 
-    // MARK: - Sessions
+    // MARK: - Process groups and sessions
 
-    private func familySection(_ family: AgentFamily, _ sessions: [SessionRecord]) -> some View {
-        let total = sessions.reduce(UInt64(0)) { $0 + $1.footprint }
-        return VStack(alignment: .leading, spacing: 1) {
-            HStack {
-                Text(family.displayName.uppercased())
-                    .kerning(0.8)
-                Spacer()
-                Text("\(sessions.count) · \(formatBytes(total))")
-                    .monospacedDigit()
+    private func processGroupRow(_ group: ProcessGroup) -> some View {
+        let expanded = model.expandedGroupKey == group.key
+        return VStack(alignment: .leading, spacing: 0) {
+            if group.family != nil {
+                Button {
+                    withAnimation(.snappy(duration: 0.18)) {
+                        model.toggleExpansion(group)
+                    }
+                } label: {
+                    processGroupLabel(group, expanded: expanded)
+                }
+                .buttonStyle(.plain)
+            } else {
+                processGroupLabel(group, expanded: false)
             }
-            .font(.caption2.weight(.semibold))
-            .foregroundStyle(.tertiary)
-            .padding(.horizontal, 6)
-            .padding(.top, 8)
-            .padding(.bottom, 3)
 
-            ForEach(sessions, id: \.key) { session in
-                sessionRow(session)
+            if expanded {
+                VStack(alignment: .leading, spacing: 1) {
+                    ForEach(model.sessions(for: group), id: \.key) { session in
+                        sessionRow(session)
+                    }
+                    if model.sessions(for: group).isEmpty {
+                        Text("no active session details")
+                            .font(.caption)
+                            .foregroundStyle(.tertiary)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 6)
+                    }
+                }
+                .padding(.leading, 10)
             }
         }
+    }
+
+    private func processGroupLabel(_ group: ProcessGroup, expanded: Bool) -> some View {
+        HStack(spacing: 8) {
+            Text(group.displayName)
+                .font(.system(size: 13, weight: .medium))
+                .lineLimit(1)
+
+            Text(groupCountLabel(group))
+                .font(.caption2)
+                .monospacedDigit()
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 5)
+                .padding(.vertical, 2)
+                .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 4))
+
+            Spacer(minLength: 8)
+
+            Text(formatBytes(group.footprint))
+                .font(.system(size: 13, weight: .semibold))
+                .monospacedDigit()
+                .foregroundStyle(group.footprint >= sessionFootprintWarningBytes ? .orange : .primary)
+                .help("Sum of macOS process footprints; shared memory can appear in more than one row")
+
+            if group.family != nil {
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(.tertiary)
+                    .rotationEffect(.degrees(expanded ? 90 : 0))
+            }
+        }
+        .padding(.horizontal, 6)
+        .padding(.vertical, 8)
+        .contentShape(Rectangle())
+        .background(expanded ? AnyShapeStyle(.quaternary.opacity(0.4)) : AnyShapeStyle(.clear),
+                    in: RoundedRectangle(cornerRadius: 6))
+    }
+
+    private func groupCountLabel(_ group: ProcessGroup) -> String {
+        if group.family != nil {
+            return group.sessionCount == 1 ? "1 session" : "\(group.sessionCount) sessions"
+        }
+        return group.processCount == 1 ? "1 proc" : "\(group.processCount) procs"
     }
 
     private func sessionRow(_ session: SessionRecord) -> some View {
@@ -321,25 +375,20 @@ struct PanelView: View {
     }
 
     private var sessionListHeight: CGFloat {
-        let rows = CGFloat(model.sessions.count) * 38
-        let headers = CGFloat(model.familyGroups.count) * 27
-        let expansion = model.expandedKey == nil
+        let rows = CGFloat(model.processGroups.count) * 38
+        let expandedSessions = model.processGroups.first { $0.key == model.expandedGroupKey }
+            .map { model.sessions(for: $0).count } ?? 0
+        let sessionRows = CGFloat(expandedSessions) * 38
+        let childRows = model.expandedKey == nil
             ? 0
             : CGFloat(max(model.expandedChildren.count, 1)) * 20 + 10
-        return min(rows + headers + expansion + 16, 380)
+        return min(rows + sessionRows + childRows + 16, 380)
     }
 
     private let snapshotRowLimit = 12
 
-    private var snapshotGroups: [(family: AgentFamily, sessions: [SessionRecord])] {
-        var remaining = snapshotRowLimit
-        var groups: [(AgentFamily, [SessionRecord])] = []
-        for group in model.familyGroups where remaining > 0 {
-            let take = Array(group.sessions.prefix(remaining))
-            remaining -= take.count
-            groups.append((group.family, take))
-        }
-        return groups
+    private var snapshotGroups: [ProcessGroup] {
+        Array(model.processGroups.prefix(snapshotRowLimit))
     }
 
     private func gbNumber(_ bytes: UInt64) -> String {
