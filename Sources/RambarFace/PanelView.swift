@@ -309,6 +309,11 @@ struct PanelView: View {
                 Menu {
                     Button("Refresh now") { model.refresh() }
                     Divider()
+                    Toggle("Notifications", isOn: Binding(
+                        get: { model.notificationsEnabled },
+                        set: { model.setNotificationsEnabled($0) }
+                    ))
+                    Divider()
                     Button("Quit Rambar") { NSApp.terminate(nil) }
                 } label: {
                     Image(systemName: "ellipsis.circle")

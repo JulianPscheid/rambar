@@ -16,6 +16,7 @@ final class FaceModel: ObservableObject {
     @Published var rising: Set<String> = []
     @Published var collectorRunning = false
     @Published var sampledAgo: Double = .infinity
+    @Published var notificationsEnabled: Bool
 
     /// Children shown when a session row expands, sampled on demand.
     @Published var expandedKey: String?
@@ -26,9 +27,16 @@ final class FaceModel: ObservableObject {
     private var lastNotifiedEventTs: Double
     private let notificationsAvailable: Bool
     private let reclaimFreshnessWindow: Double = 20
+    private let defaults: UserDefaults
 
-    init() {
-        lastNotifiedEventTs = UserDefaults.standard.double(forKey: "lastNotifiedEventTs")
+    private static let notificationsEnabledKey = "notificationsEnabled"
+
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+        notificationsEnabled = defaults.object(
+            forKey: Self.notificationsEnabledKey
+        ) as? Bool ?? false
+        lastNotifiedEventTs = defaults.double(forKey: "lastNotifiedEventTs")
         if lastNotifiedEventTs == 0 {
             lastNotifiedEventTs = Date().timeIntervalSince1970
         }
@@ -36,10 +44,8 @@ final class FaceModel: ObservableObject {
         // notifications only make sense from the installed app anyway.
         notificationsAvailable = Bundle.main.bundleIdentifier != nil
 
-        if notificationsAvailable {
-            UNUserNotificationCenter.current().requestAuthorization(
-                options: [.alert, .sound]
-            ) { _, _ in }
+        if notificationsAvailable && notificationsEnabled {
+            requestNotificationAuthorization()
         }
     }
 
@@ -135,44 +141,42 @@ final class FaceModel: ObservableObject {
 
     // MARK: - Notifications
 
-    private func notifyNewEvents(store: Store) {
+    func setNotificationsEnabled(_ enabled: Bool) {
+        notificationsEnabled = enabled
+        defaults.set(enabled, forKey: Self.notificationsEnabledKey)
         guard notificationsAvailable else { return }
+        if enabled {
+            requestNotificationAuthorization()
+        } else {
+            UNUserNotificationCenter.current().removeAllPendingNotificationRequests()
+        }
+    }
+
+    private func requestNotificationAuthorization() {
+        UNUserNotificationCenter.current().requestAuthorization(
+            options: [.alert, .sound]
+        ) { _, _ in }
+    }
+
+    private func notifyNewEvents(store: Store) {
         let events = store.events(since: lastNotifiedEventTs)
         guard !events.isEmpty else { return }
-        lastNotifiedEventTs = events.last!.ts
-        UserDefaults.standard.set(lastNotifiedEventTs, forKey: "lastNotifiedEventTs")
+        let batch = notificationBatch(
+            events: events,
+            enabled: notificationsAvailable && notificationsEnabled
+        )
+        if let updatedThrough = batch.updatedThrough {
+            lastNotifiedEventTs = updatedThrough
+            defaults.set(updatedThrough, forKey: "lastNotifiedEventTs")
+        }
 
-        for event in events {
-            let payload = (try? JSONSerialization.jsonObject(
-                with: Data(event.payload.utf8)
-            )) as? [String: String] ?? [:]
-
+        for message in batch.messages {
             let content = UNMutableNotificationContent()
-            switch event.kind {
-            case EventKind.pressure where payload["to"] != "normal":
-                content.title = "Memory pressure \(payload["to"] ?? "")"
-                if let project = payload["mover_project"],
-                   let delta = payload["mover_delta"].flatMap(UInt64.init) {
-                    content.body = "Biggest recent mover: \(project), +\(formatBytes(delta)) in 10 min"
-                } else {
-                    content.body = "The kernel raised memory pressure"
-                }
-            case EventKind.orphans:
-                let count = payload["count"] ?? "?"
-                let footprint = payload["footprint"].flatMap(UInt64.init).map(formatBytes) ?? ""
-                content.title = "Agent helpers left behind"
-                content.body = "\(count) processes outlived their session, using \(footprint)"
-            case EventKind.attention:
-                let project = payload["project"] ?? "session"
-                let footprint = payload["footprint"].flatMap(UInt64.init).map(formatBytes) ?? ""
-                content.title = "Session running large"
-                content.body = "\(project) is at \(footprint) (\(payload["procs"] ?? "?") processes)"
-            default:
-                continue
-            }
+            content.title = message.title
+            content.body = message.body
             content.sound = .default
             UNUserNotificationCenter.current().add(UNNotificationRequest(
-                identifier: "rambar-\(event.kind)-\(Int(event.ts))",
+                identifier: message.identifier,
                 content: content,
                 trigger: nil
             ))
