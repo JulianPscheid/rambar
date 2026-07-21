@@ -56,7 +56,7 @@ public struct ProcessSample: Hashable, Sendable {
 
 /// Stable process identity across samples: pid alone can be reused by the
 /// kernel, but a reused pid starts at a different time.
-public struct ProcessIdentity: Hashable, Sendable {
+public struct ProcessIdentity: Codable, Hashable, Sendable {
     public let pid: Int32
     public let start: Double
 
