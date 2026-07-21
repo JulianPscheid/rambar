@@ -1,39 +1,15 @@
 import Foundation
-import AppKit
+import Darwin
 
 /// Monitors running processes and categorizes memory usage
 class ProcessMonitor {
     static let shared = ProcessMonitor()
 
-    private init() {}
+    private var claudeOrphanTracker = ClaudeOrphanTracker()
+    private var latestClaudeOrphanIDs: Set<Int32> = []
+    private let claudeOrphanTrackerLock = NSLock()
 
-    /// App patterns for categorization — canonical list, also mirrored in RAMBarLib for testing.
-    /// Patterns prefixed with "^" match only the start of the command (case-insensitive).
-    /// Other patterns match anywhere in the command (case-insensitive).
-    static let appPatterns: [(name: String, pattern: String, color: String)] = [
-        ("Chrome", "Google Chrome", "#4285f4"),
-        ("Claude Code", "^claude", "#cc785c"),
-        ("Cursor", "Cursor", "#00bcd4"),
-        ("VS Code", "Code Helper", "#007acc"),
-        ("Slack", "Slack", "#4a154b"),
-        ("Granola", "Granola", "#f59e0b"),
-        ("Python", "python", "#3776ab"),
-        ("Node.js", "node", "#339933"),
-        ("Docker", "docker", "#2496ed"),
-        ("WhatsApp", "WhatsApp", "#25d366"),
-        ("Obsidian", "Obsidian", "#7c3aed"),
-        ("Safari", "Safari", "#006cff"),
-        ("Arc", "Arc", "#7c3aed"),
-        ("Warp", "Warp", "#01a4ff"),
-        ("Ghostty", "ghostty", "#f97316"),
-        ("iTerm", "iTerm", "#2bbc8a"),
-        ("Figma", "Figma", "#a259ff"),
-        ("Zoom", "zoom", "#2d8cff"),
-        ("Discord", "Discord", "#5865f2"),
-        ("Spotify", "Spotify", "#1db954"),
-        ("Brave", "Brave", "#fb542b"),
-        ("Firefox", "firefox", "#ff7139"),
-    ]
+    private init() {}
 
     /// Run a shell command and return output
     private func shell(_ command: String) -> String? {
@@ -103,161 +79,195 @@ class ProcessMonitor {
         return output
     }
 
-    /// Get all running processes with memory info (single ps aux call)
+    /// Read the macOS physical footprint, which includes compressed memory charged to the process.
+    private func physicalFootprint(for pid: Int32) -> UInt64? {
+        var info = rusage_info_v4()
+        let result = withUnsafeMutablePointer(to: &info) { pointer in
+            pointer.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) {
+                proc_pid_rusage(pid, RUSAGE_INFO_V4, $0)
+            }
+        }
+
+        guard result == 0, info.ri_phys_footprint > 0 else { return nil }
+        return info.ri_phys_footprint
+    }
+
+    /// Get all running processes with ancestry, terminal, and memory metadata.
     func getProcessList() -> [ProcessInfo] {
-        guard let output = shell("ps aux") else {
-            print("Failed to run ps aux")
+        guard let output = shell("ps -axww -o pid=,ppid=,tty=,rss=,command=") else {
+            print("Failed to read the process list")
             return []
         }
 
-        var processes: [ProcessInfo] = []
-        let lines = output.components(separatedBy: "\n").dropFirst() // Skip header
+        return parseProcessList(output, footprintForPid: physicalFootprint).map {
+            ProcessInfo(
+                pid: $0.pid,
+                parentPid: $0.parentPid,
+                terminal: $0.terminal ?? "??",
+                command: $0.command,
+                memory: $0.memory
+            )
+        }
+    }
 
-        for line in lines {
-            let parts = line.split(separator: " ", omittingEmptySubsequences: true)
-            guard parts.count >= 11 else { continue }
-
-            guard let pid = Int32(parts[1]),
-                  let rss = UInt64(parts[5]) else { continue }
-
-            let command = parts[10...].joined(separator: " ")
-            let memoryBytes = rss * 1024 // RSS is in KB
-
-            if memoryBytes > 1_000_000 { // Only processes > 1MB
-                processes.append(ProcessInfo(
-                    pid: pid,
-                    command: command,
-                    memory: memoryBytes
-                ))
-            }
+    /// Read only process ownership metadata for the always-on orphan watchdog.
+    /// This avoids collecting a physical footprint for every process while the
+    /// popover is closed.
+    func getProcessTopology() -> [ProcessInfo] {
+        guard let output = shell("ps -axww -o pid=,ppid=,tty=,command=") else {
+            print("Failed to read process topology")
+            return []
         }
 
-        return processes
+        return parseProcessTopology(output).map {
+            ProcessInfo(
+                pid: $0.pid,
+                parentPid: $0.parentPid,
+                terminal: $0.terminal ?? "??",
+                command: $0.command,
+                memory: 0
+            )
+        }
+    }
+
+    /// Advance orphan detection from the cheap topology scan. This is the only
+    /// call that mutates the tracker, keeping its two-observation grace period
+    /// tied to the watchdog cadence.
+    func scanClaudeOrphans(from processes: [ProcessInfo]) -> ClaudeOrphanSummary {
+        let snapshots = processes.map(\.snapshot)
+        let groups = groupClaudeProcessTrees(snapshots)
+
+        claudeOrphanTrackerLock.lock()
+        defer { claudeOrphanTrackerLock.unlock() }
+        let summary = claudeOrphanTracker.update(processes: snapshots, groups: groups)
+        latestClaudeOrphanIDs = summary.processIDs
+        return summary
+    }
+
+    /// Collect physical footprint only for the small set of processes that the
+    /// watchdog is about to report.
+    func physicalMemoryUsage(for processIDs: Set<Int32>) -> UInt64 {
+        processIDs.reduce(UInt64(0)) { total, pid in
+            total + (physicalFootprint(for: pid) ?? 0)
+        }
     }
 
     /// Get memory usage grouped by app.
-    /// Uses patterns from RAMBarLib (single source of truth).
     func getAppMemory(from processes: [ProcessInfo]) -> [AppMemory] {
-        var appMemory: [String: (memory: UInt64, count: Int, color: String)] = [:]
-        var unmatchedMemory: UInt64 = 0
-        var unmatchedCount: Int = 0
-
-        for process in processes {
-            var matched = false
-            for (name, pattern, color) in Self.appPatterns {
-                let matches: Bool
-                if pattern.hasPrefix("^") {
-                    let prefix = String(pattern.dropFirst())
-                    matches = process.command.lowercased().hasPrefix(prefix.lowercased())
-                } else {
-                    matches = process.command.localizedCaseInsensitiveContains(pattern)
-                }
-                if matches {
-                    let current = appMemory[name] ?? (0, 0, color)
-                    appMemory[name] = (current.memory + process.memory, current.count + 1, color)
-                    matched = true
-                    break
-                }
-            }
-            if !matched {
-                unmatchedMemory += process.memory
-                unmatchedCount += 1
-            }
+        categorizeProcesses(processes.map(\.snapshot), patterns: defaultAppPatterns).map {
+            AppMemory(name: $0.name, memory: $0.memory, processCount: $0.processCount, color: $0.color)
         }
-
-        var results = appMemory.map { name, data in
-            AppMemory(name: name, memory: data.memory, processCount: data.count, color: data.color)
-        }.sorted { $0.memory > $1.memory }
-
-        if unmatchedMemory > 500 * 1024 * 1024 {
-            results.append(AppMemory(name: "Other", memory: unmatchedMemory, processCount: unmatchedCount, color: "#6b7280"))
-        }
-
-        return results
     }
 
-    /// Get Claude Code sessions with project info
-    func getClaudeSessions(from processes: [ProcessInfo]) -> [ClaudeSession] {
-        let claudeProcesses = processes.filter {
-            $0.command.lowercased().hasPrefix("claude") && $0.memory > 50 * 1024 * 1024
-        }
-
+    /// Get Claude Code sessions, helper details, and processes left behind by closed sessions.
+    func getClaudeProcessReport(from processes: [ProcessInfo]) -> ClaudeProcessReport {
+        let snapshots = processes.map(\.snapshot)
+        let groups = groupClaudeProcessTrees(snapshots)
+        let workingDirectories = getWorkingDirectories(for: groups.map { $0.root.pid })
         var sessions: [ClaudeSession] = []
 
-        for process in claudeProcesses {
-            var workingDir = "Unknown"
-            if let lsofOutput = shell("lsof -p \(process.pid) 2>/dev/null | grep cwd | awk '{print $NF}' | head -1") {
-                let dir = lsofOutput.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !dir.isEmpty {
-                    workingDir = dir
-                }
-            }
+        for group in groups {
+            let process = group.root
+            let helpers = group.helperSummary
+            let workingDir = workingDirectories[process.pid] ?? "Unknown"
 
             let pathComponents = workingDir.split(separator: "/")
             let projectName = pathComponents.last.map(String.init) ?? "Unknown"
-            let isSubagent = process.memory < 500 * 1024 * 1024
 
             sessions.append(ClaudeSession(
                 pid: process.pid,
                 projectName: projectName,
                 workingDirectory: workingDir,
-                memory: process.memory,
-                isSubagent: isSubagent
+                terminal: process.terminal ?? "??",
+                memory: group.memory,
+                processCount: group.processCount,
+                helperProcessCount: helpers.total,
+                nodeProcessCount: helpers.node,
+                pythonProcessCount: helpers.python
             ))
         }
 
-        return sessions.sorted { $0.memory > $1.memory }
+        claudeOrphanTrackerLock.lock()
+        let orphanProcessIDs = latestClaudeOrphanIDs
+        claudeOrphanTrackerLock.unlock()
+        let processByPid = Dictionary(uniqueKeysWithValues: processes.map { ($0.pid, $0) })
+        let activeOrphanProcessIDs = orphanProcessIDs.intersection(processByPid.keys)
+        let orphanMemory = activeOrphanProcessIDs.reduce(UInt64(0)) { total, pid in
+            total + (processByPid[pid]?.memory ?? 0)
+        }
+        let orphanedProcesses = OrphanedClaudeProcesses(
+            processCount: activeOrphanProcessIDs.count,
+            memory: orphanMemory
+        )
+
+        return ClaudeProcessReport(
+            sessions: sessions.sorted { $0.memory > $1.memory },
+            orphanedProcesses: orphanedProcesses
+        )
     }
 
-    /// Get Chrome tabs (approximation based on renderer processes)
-    func getChromeTabs(from processes: [ProcessInfo]) -> [ChromeTab] {
+    private func getWorkingDirectories(for pids: [Int32]) -> [Int32: String] {
+        guard !pids.isEmpty else { return [:] }
+
+        let pidList = pids.map(String.init).joined(separator: ",")
+        guard let output = shell("lsof -a -d cwd -p \(pidList) -Fn") else { return [:] }
+        return parseWorkingDirectories(output)
+    }
+
+    /// Get Chrome tab titles and the actual tab count. Memory remains an
+    /// approximation because Chrome does not expose a tab-to-renderer mapping.
+    func getChromeTabReport(from processes: [ProcessInfo]) -> ChromeTabReport {
         let renderers = processes.filter {
             $0.command.contains("Google Chrome Helper (Renderer)")
         }.sorted { $0.memory > $1.memory }
+        guard !renderers.isEmpty else { return ChromeTabReport(tabs: [], tabCount: 0) }
 
-        // Get actual tab info via AppleScript
-        var tabInfo: [(title: String, url: String)] = []
+        // Get actual tab titles via AppleScript
+        var tabTitles: [String] = []
+        var tabCount: Int?
 
         if let output = shell("""
             osascript -e 'tell application "Google Chrome"
                 set tabList to ""
+                set tabCount to 0
                 try
                     repeat with w from 1 to (count of windows)
                         repeat with t from 1 to (count of tabs of window w)
                             set tabTitle to title of tab t of window w
-                            set tabURL to URL of tab t of window w
-                            set tabList to tabList & tabTitle & "|||" & tabURL & "\\n"
+                            set tabList to tabList & tabTitle & "\\n"
+                            set tabCount to tabCount + 1
                         end repeat
                     end repeat
                 end try
-                return tabList
+                return "__RAMBAR_TAB_COUNT__" & tabCount & "\\n" & tabList
             end tell' 2>/dev/null
             """) {
             let lines = output.components(separatedBy: "\n")
-            for line in lines where line.contains("|||") {
-                let parts = line.components(separatedBy: "|||")
-                if parts.count >= 2 {
-                    tabInfo.append((title: parts[0], url: parts[1]))
-                }
+            if let firstLine = lines.first,
+               firstLine.hasPrefix("__RAMBAR_TAB_COUNT__") {
+                tabCount = Int(firstLine.dropFirst("__RAMBAR_TAB_COUNT__".count))
+            }
+            for line in lines.dropFirst() where !line.isEmpty {
+                tabTitles.append(line)
             }
         }
 
         // Match tabs with renderer processes (approximate)
         var tabs: [ChromeTab] = []
         for (index, process) in renderers.prefix(15).enumerated() {
-            let info = index < tabInfo.count ? tabInfo[index] : (title: "Chrome Tab \(index + 1)", url: "")
-            let title = info.title.trimmingCharacters(in: .whitespaces)
+            let tabTitle = index < tabTitles.count ? tabTitles[index] : "Chrome Tab \(index + 1)"
+            let title = tabTitle.trimmingCharacters(in: .whitespaces)
             if title.isEmpty || title.lowercased() == "chrome" || title.lowercased() == "new tab" {
                 continue
             }
             tabs.append(ChromeTab(
+                pid: process.pid,
                 title: String(title.prefix(50)),
-                url: info.url,
                 memory: process.memory
             ))
         }
 
-        return tabs
+        return ChromeTabReport(tabs: tabs, tabCount: tabCount)
     }
 
     /// Get Python processes
@@ -344,11 +354,26 @@ class ProcessMonitor {
             }
         }
 
-        let mainSessions = state.claudeSessions.filter { !$0.isSubagent }.count
-        if mainSessions > 3 {
+        let activeSessions = state.claudeSessions.count
+        if activeSessions > 3 {
             diagnostics.append(Diagnostic(
-                message: "\(mainSessions) Claude sessions active",
+                message: "\(activeSessions) Claude sessions active",
                 severity: .warning
+            ))
+        }
+
+        if let hotSession = state.claudeSessions.filter(\.needsAttention).max(by: { $0.memory < $1.memory }) {
+            diagnostics.append(Diagnostic(
+                message: "Claude PID \(hotSession.pid) high: \(hotSession.formattedMemory), \(hotSession.processCount) processes",
+                severity: .critical
+            ))
+        }
+
+        let orphaned = state.orphanedClaudeProcesses
+        if orphaned.processCount > 0 {
+            diagnostics.append(Diagnostic(
+                message: "\(orphaned.processCount) orphaned Claude helpers using \(orphaned.formattedMemory)",
+                severity: orphaned.memory >= 1_073_741_824 ? .critical : .warning
             ))
         }
 
@@ -369,6 +394,18 @@ class ProcessMonitor {
 
 struct ProcessInfo {
     let pid: Int32
+    let parentPid: Int32
+    let terminal: String
     let command: String
     let memory: UInt64
+
+    var snapshot: ProcessSnapshot {
+        ProcessSnapshot(
+            pid: pid,
+            parentPid: parentPid,
+            terminal: terminal,
+            command: command,
+            memory: memory
+        )
+    }
 }

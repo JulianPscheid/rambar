@@ -40,11 +40,12 @@ enum MemoryStatus {
 // MARK: - Process Models
 
 struct AppMemory: Identifiable {
-    let id = UUID()
     let name: String
     let memory: UInt64  // bytes
     let processCount: Int
     let color: String
+
+    var id: String { name }
 
     var memoryMB: Double { Double(memory) / 1_048_576 }
     var memoryGB: Double { Double(memory) / 1_073_741_824 }
@@ -58,14 +59,22 @@ struct AppMemory: Identifiable {
 }
 
 struct ClaudeSession: Identifiable {
-    let id = UUID()
     let pid: Int32
     let projectName: String
     let workingDirectory: String
+    let terminal: String
     let memory: UInt64
-    let isSubagent: Bool
+    let processCount: Int
+    let helperProcessCount: Int
+    let nodeProcessCount: Int
+    let pythonProcessCount: Int
+
+    var id: Int32 { pid }
 
     var memoryMB: Double { Double(memory) / 1_048_576 }
+    var needsAttention: Bool {
+        claudeSessionNeedsAttention(memory: memory, processCount: processCount)
+    }
 
     var formattedMemory: String {
         if memoryMB >= 1024 {
@@ -75,11 +84,32 @@ struct ClaudeSession: Identifiable {
     }
 }
 
-struct ChromeTab: Identifiable {
-    let id = UUID()
-    let title: String
-    let url: String
+struct OrphanedClaudeProcesses {
+    let processCount: Int
     let memory: UInt64
+
+    static let empty = OrphanedClaudeProcesses(processCount: 0, memory: 0)
+
+    var formattedMemory: String {
+        let memoryMB = Double(memory) / 1_048_576
+        if memoryMB >= 1024 {
+            return String(format: "%.1f GB", memoryMB / 1024)
+        }
+        return String(format: "%.0f MB", memoryMB)
+    }
+}
+
+struct ClaudeProcessReport {
+    let sessions: [ClaudeSession]
+    let orphanedProcesses: OrphanedClaudeProcesses
+}
+
+struct ChromeTab: Identifiable {
+    let pid: Int32
+    let title: String
+    let memory: UInt64
+
+    var id: Int32 { pid }
 
     var memoryMB: Double { Double(memory) / 1_048_576 }
 
@@ -88,11 +118,17 @@ struct ChromeTab: Identifiable {
     }
 }
 
+struct ChromeTabReport {
+    let tabs: [ChromeTab]
+    let tabCount: Int?
+}
+
 struct PythonProcess: Identifiable {
-    let id = UUID()
     let pid: Int32
     let script: String
     let memory: UInt64
+
+    var id: Int32 { pid }
 
     var memoryMB: Double { Double(memory) / 1_048_576 }
 
@@ -105,10 +141,11 @@ struct PythonProcess: Identifiable {
 }
 
 struct VSCodeWorkspace: Identifiable {
-    let id = UUID()
     let name: String
     let memory: UInt64
     let processCount: Int
+
+    var id: String { name }
 
     var memoryMB: Double { Double(memory) / 1_048_576 }
 
@@ -123,9 +160,10 @@ struct VSCodeWorkspace: Identifiable {
 // MARK: - Diagnostic
 
 struct Diagnostic: Identifiable {
-    let id = UUID()
     let message: String
     let severity: DiagnosticSeverity
+
+    var id: String { message }
 }
 
 enum DiagnosticSeverity {
@@ -138,7 +176,10 @@ struct RAMBarState {
     var systemMemory: SystemMemory?
     var apps: [AppMemory] = []
     var claudeSessions: [ClaudeSession] = []
+    var orphanedClaudeProcesses: OrphanedClaudeProcesses = .empty
     var chromeTabs: [ChromeTab] = []
+    var chromeRendererCount: Int = 0
+    var chromeTabCount: Int?
     var pythonProcesses: [PythonProcess] = []
     var vscodeWorkspaces: [VSCodeWorkspace] = []
     var diagnostics: [Diagnostic] = []

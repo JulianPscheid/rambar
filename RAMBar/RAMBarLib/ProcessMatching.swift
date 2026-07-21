@@ -17,16 +17,221 @@ public struct AppPattern {
     }
 }
 
-/// Lightweight process representation for testing
-public struct TestProcess {
+/// Process metadata used for process-tree ownership and app categorization.
+public struct ProcessSnapshot {
     public let pid: Int32
+    public let parentPid: Int32
+    public let terminal: String?
     public let command: String
     public let memory: UInt64
 
-    public init(pid: Int32 = 0, command: String, memory: UInt64) {
+    public init(
+        pid: Int32 = 0,
+        parentPid: Int32 = 0,
+        terminal: String? = nil,
+        command: String,
+        memory: UInt64
+    ) {
         self.pid = pid
+        self.parentPid = parentPid
+        self.terminal = terminal
         self.command = command
         self.memory = memory
+    }
+}
+
+/// Parses output from `ps -axww -o pid=,ppid=,tty=,rss=,command=`.
+/// The physical-footprint provider can override RSS when macOS exposes a better measurement.
+public func parseProcessList(
+    _ output: String,
+    footprintForPid: (Int32) -> UInt64? = { _ in nil }
+) -> [ProcessSnapshot] {
+    output.components(separatedBy: "\n").compactMap { line in
+        let parts = line.split(
+            maxSplits: 4,
+            omittingEmptySubsequences: true,
+            whereSeparator: { $0.isWhitespace }
+        )
+        guard parts.count == 5,
+              let pid = Int32(parts[0]),
+              let parentPid = Int32(parts[1]),
+              let rss = UInt64(parts[3]) else {
+            return nil
+        }
+
+        return ProcessSnapshot(
+            pid: pid,
+            parentPid: parentPid,
+            terminal: String(parts[2]),
+            command: String(parts[4]),
+            memory: footprintForPid(pid) ?? rss * 1024
+        )
+    }
+}
+
+/// Parses the cheaper topology-only output from
+/// `ps -axww -o pid=,ppid=,tty=,command=`.
+public func parseProcessTopology(_ output: String) -> [ProcessSnapshot] {
+    output.components(separatedBy: "\n").compactMap { line in
+        let parts = line.split(
+            maxSplits: 3,
+            omittingEmptySubsequences: true,
+            whereSeparator: { $0.isWhitespace }
+        )
+        guard parts.count == 4,
+              let pid = Int32(parts[0]),
+              let parentPid = Int32(parts[1]) else {
+            return nil
+        }
+
+        return ProcessSnapshot(
+            pid: pid,
+            parentPid: parentPid,
+            terminal: String(parts[2]),
+            command: String(parts[3]),
+            memory: 0
+        )
+    }
+}
+
+/// Parses `lsof -a -d cwd -p <pid-list> -Fn` output into working directories.
+public func parseWorkingDirectories(_ output: String) -> [Int32: String] {
+    var currentPid: Int32?
+    var directories: [Int32: String] = [:]
+
+    for line in output.split(separator: "\n", omittingEmptySubsequences: true) {
+        switch line.first {
+        case "p":
+            currentPid = Int32(line.dropFirst())
+        case "n":
+            guard let currentPid else { continue }
+            directories[currentPid] = String(line.dropFirst())
+        default:
+            continue
+        }
+    }
+
+    return directories
+}
+
+/// One interactive Claude Code process and every process descended from it.
+public struct ClaudeProcessGroup {
+    public let root: ProcessSnapshot
+    public let processes: [ProcessSnapshot]
+
+    public var memory: UInt64 {
+        processes.reduce(0) { $0 + $1.memory }
+    }
+
+    public var processCount: Int {
+        processes.count
+    }
+
+    public var helperSummary: ClaudeHelperSummary {
+        let helpers = processes.filter { $0.pid != root.pid }
+        return ClaudeHelperSummary(
+            total: helpers.count,
+            node: helpers.filter { executableBasename($0.command) == "node" }.count,
+            python: helpers.filter { executableBasename($0.command).hasPrefix("python") }.count,
+            claude: helpers.filter { isClaudeCLICommand($0.command) }.count
+        )
+    }
+}
+
+public struct ClaudeHelperSummary {
+    public let total: Int
+    public let node: Int
+    public let python: Int
+    public let claude: Int
+}
+
+public let claudeSessionMemoryWarningThreshold: UInt64 = 3 * 1_073_741_824
+public let claudeSessionProcessWarningThreshold = 40
+
+public func claudeSessionNeedsAttention(memory: UInt64, processCount: Int) -> Bool {
+    memory >= claudeSessionMemoryWarningThreshold || processCount >= claudeSessionProcessWarningThreshold
+}
+
+public struct ClaudeOrphanSummary {
+    public let processIDs: Set<Int32>
+    public let memory: UInt64
+    public let newProcessCount: Int
+
+    public var processCount: Int {
+        processIDs.count
+    }
+}
+
+public struct ClaudeOrphanTracker {
+    private struct Candidate {
+        let command: String
+        var observationCount: Int
+    }
+
+    private var previousClaimedChildren: [Int32: String] = [:]
+    private var candidates: [Int32: Candidate] = [:]
+    private var orphanedProcesses: [Int32: String] = [:]
+
+    public init() {}
+
+    public mutating func update(
+        processes: [ProcessSnapshot],
+        groups: [ClaudeProcessGroup]
+    ) -> ClaudeOrphanSummary {
+        let activeByPid = Dictionary(uniqueKeysWithValues: processes.filter { $0.pid > 0 }.map { ($0.pid, $0) })
+        let currentlyClaimed = Dictionary(uniqueKeysWithValues: groups.flatMap { group in
+            group.processes.map { ($0.pid, $0.command) }
+        })
+        let currentlyClaimedChildren = Dictionary(uniqueKeysWithValues: groups.flatMap { group in
+            group.processes.compactMap { process in
+                process.pid == group.root.pid ? nil : (process.pid, process.command)
+            }
+        })
+
+        func isStillDetached(pid: Int32, command: String) -> Bool {
+            activeByPid[pid]?.command == command && currentlyClaimed[pid] == nil
+        }
+
+        orphanedProcesses = orphanedProcesses.filter { pid, originalCommand in
+            isStillDetached(pid: pid, command: originalCommand)
+        }
+        candidates = candidates.filter { pid, candidate in
+            isStillDetached(pid: pid, command: candidate.command)
+        }
+
+        var newlyPromoted = 0
+        for pid in Array(candidates.keys) {
+            guard var candidate = candidates[pid] else { continue }
+            candidate.observationCount += 1
+            if candidate.observationCount >= 2 {
+                orphanedProcesses[pid] = candidate.command
+                candidates.removeValue(forKey: pid)
+                newlyPromoted += 1
+            } else {
+                candidates[pid] = candidate
+            }
+        }
+
+        for (pid, command) in previousClaimedChildren
+        where currentlyClaimedChildren[pid] == nil &&
+            isStillDetached(pid: pid, command: command) &&
+            orphanedProcesses[pid] == nil &&
+            candidates[pid] == nil {
+            candidates[pid] = Candidate(command: command, observationCount: 1)
+        }
+
+        previousClaimedChildren = currentlyClaimedChildren
+
+        let orphanedProcessIDs = Set(orphanedProcesses.keys)
+        let memory = orphanedProcessIDs.reduce(UInt64(0)) { total, pid in
+            total + (activeByPid[pid]?.memory ?? 0)
+        }
+
+        return ClaudeOrphanSummary(
+            processIDs: orphanedProcessIDs,
+            memory: memory,
+            newProcessCount: newlyPromoted
+        )
     }
 }
 
@@ -48,6 +253,81 @@ public func matchesAppPattern(_ command: String, pattern: String) -> Bool {
     } else {
         return command.localizedCaseInsensitiveContains(pattern)
     }
+}
+
+private func executableBasename(_ command: String) -> String {
+    guard let executable = command.split(whereSeparator: { $0.isWhitespace }).first else {
+        return ""
+    }
+    return executable.split(separator: "/").last.map { $0.lowercased() } ?? ""
+}
+
+/// Returns true for Claude Code CLI executables without matching Claude Desktop.
+public func isClaudeCLICommand(_ command: String) -> Bool {
+    guard let executable = command.split(whereSeparator: { $0.isWhitespace }).first else {
+        return false
+    }
+
+    let path = String(executable).lowercased()
+    if path.contains(".app/contents/macos/") {
+        return false
+    }
+
+    let basename = executableBasename(command)
+    return basename == "claude" || path.contains("/.local/share/claude/versions/")
+}
+
+/// Groups all recursive descendants under each top-level, terminal-attached Claude CLI process.
+/// Descendants can be npm, Node, Python, or any other helper executable.
+public func groupClaudeProcessTrees(_ processes: [ProcessSnapshot]) -> [ClaudeProcessGroup] {
+    let processByPid = Dictionary(uniqueKeysWithValues: processes.filter { $0.pid > 0 }.map { ($0.pid, $0) })
+
+    func hasAttachedTerminal(_ process: ProcessSnapshot) -> Bool {
+        guard let terminal = process.terminal?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !terminal.isEmpty else {
+            return false
+        }
+        return terminal != "??" && terminal != "?" && terminal != "-"
+    }
+
+    func hasClaudeAncestor(_ process: ProcessSnapshot) -> Bool {
+        var parentPid = process.parentPid
+        var visited: Set<Int32> = [process.pid]
+
+        while parentPid > 0, visited.insert(parentPid).inserted,
+              let parent = processByPid[parentPid] {
+            if isClaudeCLICommand(parent.command) {
+                return true
+            }
+            parentPid = parent.parentPid
+        }
+        return false
+    }
+
+    let roots = processes.filter {
+        $0.pid > 0 && isClaudeCLICommand($0.command) && hasAttachedTerminal($0) && !hasClaudeAncestor($0)
+    }
+    let rootPids = Set(roots.map(\.pid))
+    var groupedProcesses: [Int32: [ProcessSnapshot]] = [:]
+
+    for process in processes where process.pid > 0 {
+        var currentPid = process.pid
+        var visited: Set<Int32> = []
+
+        while currentPid > 0, visited.insert(currentPid).inserted {
+            if rootPids.contains(currentPid) {
+                groupedProcesses[currentPid, default: []].append(process)
+                break
+            }
+            guard let current = processByPid[currentPid] else { break }
+            currentPid = current.parentPid
+        }
+    }
+
+    return roots.compactMap { root in
+        guard let ownedProcesses = groupedProcesses[root.pid] else { return nil }
+        return ClaudeProcessGroup(root: root, processes: ownedProcesses)
+    }.sorted { $0.memory > $1.memory }
 }
 
 /// Default app patterns used by RAMBar
@@ -78,12 +358,16 @@ public let defaultAppPatterns: [AppPattern] = [
 
 /// Categorize processes into app groups using pattern matching.
 /// Returns sorted by memory descending, with an "Other" entry if unmatched > 500MB.
-public func categorizeProcesses(_ processes: [TestProcess], patterns: [AppPattern]) -> [AppCategoryResult] {
+public func categorizeProcesses(_ processes: [ProcessSnapshot], patterns: [AppPattern]) -> [AppCategoryResult] {
     var appMemory: [String: (memory: UInt64, count: Int, color: String)] = [:]
     var unmatchedMemory: UInt64 = 0
     var unmatchedCount: Int = 0
 
-    for process in processes {
+    let claudePattern = patterns.first { $0.name == "Claude Code" }
+    let claudeGroups = claudePattern == nil ? [] : groupClaudeProcessTrees(processes)
+    let claudeOwnedPids = Set(claudeGroups.flatMap { $0.processes.map(\.pid) })
+
+    for process in processes where !claudeOwnedPids.contains(process.pid) {
         var matched = false
         for p in patterns {
             if matchesAppPattern(process.command, pattern: p.pattern) {
@@ -99,6 +383,15 @@ public func categorizeProcesses(_ processes: [TestProcess], patterns: [AppPatter
         }
     }
 
+    if let claudePattern, !claudeGroups.isEmpty {
+        let unownedClaude = appMemory[claudePattern.name] ?? (0, 0, claudePattern.color)
+        appMemory[claudePattern.name] = (
+            unownedClaude.memory + claudeGroups.reduce(0) { $0 + $1.memory },
+            unownedClaude.count + claudeGroups.count,
+            claudePattern.color
+        )
+    }
+
     var results = appMemory.map { name, data in
         AppCategoryResult(name: name, memory: data.memory, processCount: data.count, color: data.color)
     }.sorted { $0.memory > $1.memory }
@@ -112,8 +405,13 @@ public func categorizeProcesses(_ processes: [TestProcess], patterns: [AppPatter
 
 /// Filter processes to only actual Claude CLI sessions (not node subprocesses).
 /// Only processes whose command starts with "claude" and use > 50MB qualify.
-public func filterClaudeSessions(_ processes: [TestProcess]) -> [TestProcess] {
+public func filterClaudeSessions(_ processes: [ProcessSnapshot]) -> [ProcessSnapshot] {
+    let groups = groupClaudeProcessTrees(processes)
+    if !groups.isEmpty {
+        return groups.map(\.root)
+    }
+
     return processes.filter {
-        $0.command.lowercased().hasPrefix("claude") && $0.memory > 50 * 1024 * 1024
+        isClaudeCLICommand($0.command) && $0.memory > 50 * 1024 * 1024
     }
 }

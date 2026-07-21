@@ -1,14 +1,21 @@
 import Cocoa
 import SwiftUI
 
-class AppDelegate: NSObject, NSApplicationDelegate {
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var statusItem: NSStatusItem!
     private var popover: NSPopover!
     private var updateTimer: Timer?
     private var lastMemoryWarningTime: Date?
-    private var contentView: ContentView?
+    private let viewModel = RAMBarViewModel()
+    private let orphanScanQueue = DispatchQueue(label: "com.maxghenis.RAMBar.orphan-watchdog", qos: .utility)
+    private var orphanScanInFlight = false
+    private var statusUpdateCount = 0
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Initialize notification authorization and workspace observers on the main actor.
+        _ = CrashDetector.shared
+
         // Create status bar item
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
 
@@ -20,20 +27,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         // Create popover
-        let view = ContentView()
-        contentView = view
         popover = NSPopover()
         popover.contentSize = NSSize(width: 380, height: 520)
         popover.behavior = .transient
+        popover.delegate = self
         popover.animates = true
-        popover.contentViewController = NSHostingController(rootView: view)
+        popover.contentViewController = NSHostingController(rootView: ContentView(viewModel: viewModel))
 
         // Start update timer — 5s is responsive enough for a menu bar icon
         updateTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
-            self?.updateStatusButton()
-            self?.checkMemoryPressure()
+            Task { @MainActor in
+                self?.handleStatusTimer()
+            }
         }
         RunLoop.main.add(updateTimer!, forMode: .common)
+        scanForOrphanedClaudeHelpers()
 
         // Delay first update so user sees "Loading..." briefly
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
@@ -50,13 +58,57 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         if popover.isShown {
             popover.performClose(nil)
-            contentView?.setPopoverVisible(false)
         } else {
-            contentView?.setPopoverVisible(true)
+            viewModel.setPopoverVisible(true)
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
 
             // Ensure popover window is key
             popover.contentViewController?.view.window?.makeKey()
+        }
+    }
+
+    func popoverDidClose(_ notification: Notification) {
+        viewModel.setPopoverVisible(false)
+    }
+
+    private func handleStatusTimer() {
+        updateStatusButton()
+        checkMemoryPressure()
+        statusUpdateCount += 1
+        if statusUpdateCount.isMultiple(of: 2) {
+            scanForOrphanedClaudeHelpers()
+        }
+    }
+
+    /// Keep process-tree safeguards active even when the popover is closed.
+    /// The scan reads only PID, PPID, TTY, and command metadata. It collects
+    /// physical memory only if a helper survives the grace observation.
+    private func scanForOrphanedClaudeHelpers() {
+        guard !orphanScanInFlight else { return }
+        orphanScanInFlight = true
+
+        orphanScanQueue.async {
+            let processes = ProcessMonitor.shared.getProcessTopology()
+            guard !processes.isEmpty else {
+                DispatchQueue.main.async { [weak self] in
+                    self?.orphanScanInFlight = false
+                }
+                return
+            }
+
+            let summary = ProcessMonitor.shared.scanClaudeOrphans(from: processes)
+            let memory = summary.newProcessCount > 0
+                ? ProcessMonitor.shared.physicalMemoryUsage(for: summary.processIDs)
+                : 0
+
+            DispatchQueue.main.async { [weak self] in
+                self?.orphanScanInFlight = false
+                guard summary.newProcessCount > 0 else { return }
+                CrashDetector.shared.sendOrphanedClaudeWarning(
+                    processCount: summary.processCount,
+                    memory: memory
+                )
+            }
         }
     }
 
@@ -67,6 +119,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let percent = Int(memory.usagePercent)
 
         // Create attributed string with icon and percentage
+        let font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
         let attachment = NSTextAttachment()
         let config = NSImage.SymbolConfiguration(pointSize: 12, weight: .medium)
 
@@ -87,14 +140,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         if let symbol = NSImage(systemSymbolName: symbolName, accessibilityDescription: nil)?
             .withSymbolConfiguration(config) {
-            attachment.image = symbol.tinted(with: color)
+            let tintedSymbol = symbol.tinted(with: color)
+            attachment.image = tintedSymbol
+            attachment.bounds = NSRect(
+                x: 0,
+                y: (font.capHeight - tintedSymbol.size.height) / 2,
+                width: tintedSymbol.size.width,
+                height: tintedSymbol.size.height
+            )
         }
 
         let attachmentString = NSAttributedString(attachment: attachment)
         let percentString = NSAttributedString(
             string: " \(percent)%",
             attributes: [
-                .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium),
+                .font: font,
                 .foregroundColor: color
             ]
         )

@@ -22,16 +22,12 @@ extension Color {
 }
 
 struct ContentView: View {
-    @StateObject private var viewModel = RAMBarViewModel()
-
-    func setPopoverVisible(_ visible: Bool) {
-        viewModel.setPopoverVisible(visible)
-    }
+    @ObservedObject var viewModel: RAMBarViewModel
 
     var body: some View {
         VStack(spacing: 0) {
             // Header
-            HeaderView(memory: viewModel.isLoading ? nil : viewModel.state.systemMemory, onRefresh: { viewModel.refreshAsync() }, isRefreshing: viewModel.isRefreshing)
+            HeaderView(memory: viewModel.isLoading ? nil : viewModel.state.systemMemory, onRefresh: { viewModel.refreshAsync(showProgress: true) }, isRefreshing: viewModel.isRefreshing)
 
             Rectangle()
                 .fill(Color.retroBorder)
@@ -61,7 +57,11 @@ struct ContentView: View {
                         AppsListView(
                             apps: viewModel.state.apps,
                             claudeSessions: viewModel.state.claudeSessions,
-                            chromeTabs: viewModel.state.chromeTabs
+                            chromeTabs: viewModel.state.chromeTabs,
+                            chromeRendererCount: viewModel.state.chromeRendererCount,
+                            chromeTabCount: viewModel.state.chromeTabCount,
+                            isLoadingChromeTabs: viewModel.isLoadingChromeTabs,
+                            onChromeExpandedChanged: viewModel.setChromeDetailsExpanded
                         )
 
                         // Compact diagnostics
@@ -87,77 +87,137 @@ struct ContentView: View {
 
 // MARK: - View Model
 
-class RAMBarViewModel: ObservableObject {
+@MainActor
+final class RAMBarViewModel: ObservableObject {
     @Published var state = RAMBarState()
     @Published var isLoading = true
     @Published var isRefreshing = false
+    @Published var isLoadingChromeTabs = false
 
-    private var timer: Timer?
+    private let refreshQueue = DispatchQueue(label: "com.maxghenis.RAMBar.refresh", qos: .userInitiated)
+    private var lastChromeTabsRefresh: Date?
+    private var latestChromeRendererProcesses: [ProcessInfo] = []
+    private var refreshInFlight = false
+    private var isPopoverVisible = false
+    private var chromeDetailsExpanded = false
+    private lazy var popoverRefreshController = PopoverRefreshController(
+        interval: 5.0,
+        refresh: { [weak self] in self?.refreshAsync() },
+        schedule: { interval, handler in
+            let timer = Timer(timeInterval: interval, repeats: true) { _ in handler() }
+            RunLoop.main.add(timer, forMode: .common)
+            return { timer.invalidate() }
+        }
+    )
 
     init() {
         // Load full data in background on first open
         refreshAsync()
     }
 
-    deinit {
-        timer?.invalidate()
-    }
-
-    /// Start/stop the refresh timer based on popover visibility.
-    /// No point polling every 3s when the popover is closed — this is the
-    /// main fix for the "significant energy" warning.
+    /// Start or stop full process and memory refreshes with the popover.
     func setPopoverVisible(_ visible: Bool) {
-        if visible {
-            // Refresh immediately when opened, then every 3s
-            refreshAsync()
-            guard timer == nil else { return }
-            let t = Timer(timeInterval: 3.0, repeats: true) { [weak self] _ in
-                self?.refreshAsync()
-            }
-            RunLoop.main.add(t, forMode: .common)
-            timer = t
-        } else {
-            timer?.invalidate()
-            timer = nil
+        isPopoverVisible = visible
+        popoverRefreshController.setActive(visible)
+        if visible && chromeDetailsExpanded {
+            refreshChromeTabsIfNeeded()
         }
     }
 
-    func refreshAsync() {
-        guard !isRefreshing else { return }
-        isRefreshing = true
+    func setChromeDetailsExpanded(_ expanded: Bool) {
+        chromeDetailsExpanded = expanded
+        if expanded {
+            refreshChromeTabsIfNeeded()
+        }
+    }
 
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            // Get system memory (fast, no shell)
-            let memory = MemoryMonitor.shared.getSystemMemory()
+    func refreshAsync(showProgress: Bool = false) {
+        guard !refreshInFlight else { return }
+        refreshInFlight = true
+        if showProgress {
+            isRefreshing = true
+        }
 
-            // Get process data — single ps aux call, reused across all queries
-            let processes = ProcessMonitor.shared.getProcessList()
-            let apps = ProcessMonitor.shared.getAppMemory(from: processes)
-            let claude = ProcessMonitor.shared.getClaudeSessions(from: processes)
-            let python = ProcessMonitor.shared.getPythonProcesses(from: processes)
-            let vscode = ProcessMonitor.shared.getVSCodeWorkspaces(from: processes)
-            let chrome = ProcessMonitor.shared.getChromeTabs(from: processes)
+        refreshQueue.async { [weak self] in
+            guard let self else { return }
 
-            var newState = RAMBarState()
-            newState.systemMemory = memory
-            newState.apps = apps
-            newState.claudeSessions = claude
-            newState.pythonProcesses = python
-            newState.vscodeWorkspaces = vscode
-            newState.chromeTabs = chrome
-            newState.lastUpdate = Date()
-            newState.diagnostics = ProcessMonitor.shared.generateDiagnostics(state: newState)
+            let result = autoreleasepool { () -> (state: RAMBarState, usagePercent: Double, chromeRenderers: [ProcessInfo]) in
+                // Get system memory (fast, no shell)
+                let memory = MemoryMonitor.shared.getSystemMemory()
 
-            // Track memory history (last 30 readings)
-            var history = self?.state.memoryHistory ?? []
-            history.append(memory.usagePercent)
-            if history.count > 30 { history.removeFirst(history.count - 30) }
-            newState.memoryHistory = history
+                // Get process data once and reuse it across all queries
+                let processes = ProcessMonitor.shared.getProcessList()
+                let apps = ProcessMonitor.shared.getAppMemory(from: processes)
+                let claude = ProcessMonitor.shared.getClaudeProcessReport(from: processes)
+                let chromeRenderers = processes.filter {
+                    $0.command.contains("Google Chrome Helper (Renderer)")
+                }
 
-            DispatchQueue.main.async {
-                self?.state = newState
-                self?.isLoading = false
-                self?.isRefreshing = false
+                var newState = RAMBarState()
+                newState.systemMemory = memory
+                newState.apps = apps
+                newState.claudeSessions = claude.sessions
+                newState.orphanedClaudeProcesses = claude.orphanedProcesses
+                newState.chromeRendererCount = chromeRenderers.count
+                newState.lastUpdate = Date()
+                newState.diagnostics = ProcessMonitor.shared.generateDiagnostics(state: newState)
+                return (newState, memory.usagePercent, chromeRenderers)
+            }
+
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                var newState = result.state
+                self.latestChromeRendererProcesses = result.chromeRenderers
+
+                // Preserve independently-loaded Chrome details and append history on the main thread.
+                if newState.chromeRendererCount > 0 {
+                    newState.chromeTabs = self.state.chromeTabs
+                    newState.chromeTabCount = self.state.chromeTabCount
+                } else {
+                    newState.chromeTabs = []
+                    newState.chromeTabCount = nil
+                    self.lastChromeTabsRefresh = nil
+                }
+
+                var history = self.state.memoryHistory
+                history.append(result.usagePercent)
+                if history.count > 30 { history.removeFirst(history.count - 30) }
+                newState.memoryHistory = history
+
+                self.state = newState
+                self.isLoading = false
+                self.refreshInFlight = false
+                self.isRefreshing = false
+                if self.isPopoverVisible && self.chromeDetailsExpanded {
+                    self.refreshChromeTabsIfNeeded()
+                }
+            }
+        }
+    }
+
+    func refreshChromeTabsIfNeeded() {
+        guard isPopoverVisible,
+              chromeDetailsExpanded,
+              !isLoadingChromeTabs,
+              state.apps.contains(where: { $0.name == "Chrome" }) else { return }
+        if let lastChromeTabsRefresh,
+           Date().timeIntervalSince(lastChromeTabsRefresh) < 30 {
+            return
+        }
+
+        isLoadingChromeTabs = true
+        let chromeRenderers = latestChromeRendererProcesses
+        refreshQueue.async { [weak self] in
+            let report = autoreleasepool {
+                ProcessMonitor.shared.getChromeTabReport(from: chromeRenderers)
+            }
+
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.state.chromeTabs = report.tabs
+                self.state.chromeTabCount = report.tabCount
+                self.lastChromeTabsRefresh = Date()
+                self.isLoadingChromeTabs = false
             }
         }
     }
@@ -479,6 +539,10 @@ struct AppsListView: View {
     let apps: [AppMemory]
     let claudeSessions: [ClaudeSession]
     let chromeTabs: [ChromeTab]
+    let chromeRendererCount: Int
+    let chromeTabCount: Int?
+    let isLoadingChromeTabs: Bool
+    let onChromeExpandedChanged: (Bool) -> Void
 
     // Keep expanded state here so it persists across timer refreshes
     @State private var claudeExpanded = false
@@ -496,19 +560,42 @@ struct AppsListView: View {
                     ) {
                         ClaudeSessionsView(sessions: claudeSessions)
                     }
-                } else if app.name == "Chrome" && !chromeTabs.isEmpty {
+                } else if app.name == "Chrome" {
+                    let chromeDetail = ChromeDetailCount(
+                        rendererCount: chromeRendererCount,
+                        tabCount: chromeTabCount
+                    )
                     ExpandableAppRow(
                         app: app,
-                        detailCount: chromeTabs.count,
-                        detailLabel: "tabs",
+                        detailCount: chromeDetail.count,
+                        detailLabel: chromeDetail.label,
                         isExpanded: $chromeExpanded
                     ) {
-                        ChromeTabsView(tabs: chromeTabs)
+                        if isLoadingChromeTabs {
+                            HStack(spacing: 8) {
+                                ProgressView()
+                                    .controlSize(.small)
+                                Text("Loading Chrome tabs...")
+                                    .font(.system(.caption2, design: .monospaced))
+                                    .foregroundColor(.retroTextMuted)
+                            }
+                            .padding(.vertical, 8)
+                        } else if chromeTabs.isEmpty {
+                            Text("Chrome tab details unavailable")
+                                .font(.system(.caption2, design: .monospaced))
+                                .foregroundColor(.retroTextMuted)
+                                .padding(.vertical, 8)
+                        } else {
+                            ChromeTabsView(tabs: chromeTabs)
+                        }
                     }
                 } else {
                     AppRowView(app: app)
                 }
             }
+        }
+        .onChange(of: chromeExpanded) { _, isExpanded in
+            onChromeExpandedChanged(isExpanded)
         }
     }
 }
@@ -710,6 +797,7 @@ struct ClaudeSessionsView: View {
     var body: some View {
         VStack(spacing: 4) {
             ForEach(sessions) { session in
+                let accentColor = session.needsAttention ? Color.retroMagenta : Color.retroAmber
                 HStack {
                     VStack(alignment: .leading, spacing: 2) {
                         HStack(spacing: 6) {
@@ -718,17 +806,28 @@ struct ClaudeSessionsView: View {
                                 .foregroundColor(.retroTextPrimary)
                                 .lineLimit(1)
 
-                            Text(session.isSubagent ? "SUB" : "MAIN")
+                            Text("\(session.processCount) PROC")
                                 .font(.system(.caption2, design: .monospaced))
                                 .fontWeight(.bold)
-                                .foregroundColor(session.isSubagent ? .retroTextMuted : .retroAmber)
+                                .foregroundColor(accentColor)
                                 .padding(.horizontal, 4)
                                 .padding(.vertical, 1)
-                                .background(session.isSubagent ? Color.retroTextMuted.opacity(0.2) : Color.retroAmber.opacity(0.2))
+                                .background(accentColor.opacity(0.2))
                                 .cornerRadius(2)
+
+                            if session.needsAttention {
+                                Text("HIGH")
+                                    .font(.system(.caption2, design: .monospaced))
+                                    .fontWeight(.bold)
+                                    .foregroundColor(.retroMagenta)
+                            }
                         }
 
-                        Text("PID \(session.pid)")
+                        Text("PID \(session.pid) · \(session.terminal)")
+                            .font(.system(.caption2, design: .monospaced))
+                            .foregroundColor(.retroTextMuted)
+
+                        Text("\(session.helperProcessCount) HELPERS · \(session.nodeProcessCount) NODE · \(session.pythonProcessCount) PY")
                             .font(.system(.caption2, design: .monospaced))
                             .foregroundColor(.retroTextMuted)
                     }
@@ -742,10 +841,10 @@ struct ClaudeSessionsView: View {
                 }
                 .padding(.vertical, 6)
                 .padding(.horizontal, 8)
-                .background(Color.retroSurfaceRaised)
+                .background(session.needsAttention ? Color.retroMagenta.opacity(0.08) : Color.retroSurfaceRaised)
                 .overlay(
                     RoundedRectangle(cornerRadius: 4)
-                        .stroke(Color.retroBorder, lineWidth: 1)
+                        .stroke(session.needsAttention ? Color.retroMagenta.opacity(0.5) : Color.retroBorder, lineWidth: 1)
                 )
                 .cornerRadius(4)
             }
@@ -1107,5 +1206,5 @@ extension Color {
 }
 
 #Preview {
-    ContentView()
+    ContentView(viewModel: RAMBarViewModel())
 }

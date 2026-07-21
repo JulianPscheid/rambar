@@ -3,7 +3,8 @@ import AppKit
 import UserNotifications
 
 /// Monitors for app crashes, specifically VSCode
-class CrashDetector: ObservableObject {
+@MainActor
+final class CrashDetector: ObservableObject {
     static let shared = CrashDetector()
 
     @Published var vscodeRunning = true
@@ -30,7 +31,9 @@ class CrashDetector: ObservableObject {
             object: nil,
             queue: .main
         ) { [weak self] notification in
-            self?.handleAppLaunch(notification)
+            Task { @MainActor in
+                self?.handleAppLaunch(notification)
+            }
         }
         observers.append(launchObserver)
 
@@ -40,7 +43,9 @@ class CrashDetector: ObservableObject {
             object: nil,
             queue: .main
         ) { [weak self] notification in
-            self?.handleAppTerminate(notification)
+            Task { @MainActor in
+                self?.handleAppTerminate(notification)
+            }
         }
         observers.append(terminateObserver)
 
@@ -119,6 +124,25 @@ class CrashDetector: ObservableObject {
 
         let request = UNNotificationRequest(
             identifier: "memory-warning",
+            content: content,
+            trigger: nil
+        )
+
+        UNUserNotificationCenter.current().add(request)
+    }
+
+    func sendOrphanedClaudeWarning(processCount: Int, memory: UInt64) {
+        let memoryMB = Double(memory) / 1_048_576
+        let formattedMemory = memoryMB >= 1024
+            ? String(format: "%.1f GB", memoryMB / 1024)
+            : String(format: "%.0f MB", memoryMB)
+        let content = UNMutableNotificationContent()
+        content.title = "Claude Helpers Still Running"
+        content.body = "\(processCount) processes survived a closed session and are using \(formattedMemory)"
+        content.sound = .default
+
+        let request = UNNotificationRequest(
+            identifier: "claude-orphan-warning",
             content: content,
             trigger: nil
         )
