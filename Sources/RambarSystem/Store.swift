@@ -78,6 +78,12 @@ public enum StoreError: Error {
     case exec(String)
 }
 
+public enum ProcessGroupSnapshotStatus: Equatable, Sendable {
+    case missing
+    case fresh
+    case stale
+}
+
 /// SQLite persistence at ~/.rambar/rambar.sqlite. WAL mode so the single
 /// writer (daemon) and many readers (CLI, face, MCP) never block each other.
 public final class Store {
@@ -143,7 +149,17 @@ public final class Store {
                 last_seen REAL NOT NULL,
                 footprint INTEGER NOT NULL,
                 procs INTEGER NOT NULL,
-                sessions INTEGER NOT NULL
+                sessions INTEGER NOT NULL,
+                host_footprint INTEGER NOT NULL DEFAULT 0,
+                host_procs INTEGER NOT NULL DEFAULT 0
+            )
+            """)
+        try? execute("ALTER TABLE process_group ADD COLUMN host_footprint INTEGER NOT NULL DEFAULT 0")
+        try? execute("ALTER TABLE process_group ADD COLUMN host_procs INTEGER NOT NULL DEFAULT 0")
+        try execute("""
+            CREATE TABLE IF NOT EXISTS process_group_snapshot(
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                ts REAL NOT NULL
             )
             """)
         try execute("""
@@ -334,19 +350,16 @@ public final class Store {
     public func record(ts: Double, processGroups: [ProcessGroup]) throws {
         try execute("BEGIN")
         do {
+            // This table is the latest complete process snapshot, not a set
+            // of independently expiring rows. Readers see either the old or
+            // new snapshot under WAL, including a valid empty snapshot.
+            try execute("DELETE FROM process_group")
             for group in processGroups {
                 try execute("""
                     INSERT INTO process_group(
-                        key, display_name, family, kind, last_seen, footprint, procs, sessions
-                    ) VALUES(?,?,?,?,?,?,?,?)
-                    ON CONFLICT(key) DO UPDATE SET
-                        display_name=excluded.display_name,
-                        family=excluded.family,
-                        kind=excluded.kind,
-                        last_seen=excluded.last_seen,
-                        footprint=excluded.footprint,
-                        procs=excluded.procs,
-                        sessions=excluded.sessions
+                        key, display_name, family, kind, last_seen, footprint, procs, sessions,
+                        host_footprint, host_procs
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?)
                     """, [
                         .text(group.key),
                         .text(group.displayName),
@@ -356,8 +369,14 @@ public final class Store {
                         .int(Int64(bitPattern: group.footprint)),
                         .int(Int64(group.processCount)),
                         .int(Int64(group.sessionCount)),
+                        .int(Int64(bitPattern: group.hostFootprint)),
+                        .int(Int64(group.hostProcessCount)),
                     ])
             }
+            try execute(
+                "INSERT OR REPLACE INTO process_group_snapshot(id, ts) VALUES(1,?)",
+                [.real(ts)]
+            )
             try execute("COMMIT")
         } catch {
             try? execute("ROLLBACK")
@@ -366,11 +385,22 @@ public final class Store {
     }
 
     public struct DuplicateJSON: Codable, Sendable {
+        public let commandPath: String?
         public let basename: String
         public let count: Int
         public let footprint: UInt64
 
-        public init(basename: String, count: Int, footprint: UInt64) {
+        public var stableKey: String {
+            commandPath ?? "\(basename):\(count):\(footprint)"
+        }
+
+        public init(
+            commandPath: String? = nil,
+            basename: String,
+            count: Int,
+            footprint: UInt64
+        ) {
+            self.commandPath = commandPath
             self.basename = basename
             self.count = count
             self.footprint = footprint
@@ -382,7 +412,12 @@ public final class Store {
     ) throws {
         let pids = report.identities.map { String($0.pid) }.sorted().joined(separator: ",")
         let dups = duplicates.map {
-            DuplicateJSON(basename: $0.basename, count: $0.count, footprint: $0.footprint)
+            DuplicateJSON(
+                commandPath: $0.commandPath,
+                basename: $0.basename,
+                count: $0.count,
+                footprint: $0.footprint
+            )
         }
         let dupsJSON = (try? JSONEncoder().encode(dups))
             .map { String(decoding: $0, as: UTF8.self) } ?? "[]"
@@ -485,7 +520,7 @@ public final class Store {
 
     /// Sessions observed within the staleness window, largest first.
     public func activeSessions(now: Double, staleAfter: Double = 20) -> [SessionRecord] {
-        query("""
+        return query("""
             SELECT \(Self.sessionColumns) FROM session
             WHERE last_seen >= ? ORDER BY footprint DESC
             """, [.real(now - staleAfter)], row: Self.sessionRecord)
@@ -493,11 +528,15 @@ public final class Store {
 
     /// Process groups observed within the staleness window, largest first.
     public func activeProcessGroups(now: Double, staleAfter: Double = 20) -> [ProcessGroup] {
-        query("""
-            SELECT key, display_name, family, kind, footprint, procs, sessions
-            FROM process_group WHERE last_seen >= ?
+        guard processGroupSnapshotStatus(now: now, staleAfter: staleAfter) == .fresh else {
+            return []
+        }
+        return query("""
+            SELECT key, display_name, family, kind, footprint, procs, sessions,
+                   host_footprint, host_procs
+            FROM process_group
             ORDER BY footprint DESC, display_name ASC
-            """, [.real(now - staleAfter)]) { statement in
+            """) { statement in
                 let family = Self.optionalText(statement, 2).flatMap(AgentFamily.init(rawValue:))
                 return ProcessGroup(
                     key: Self.text(statement, 0),
@@ -506,9 +545,27 @@ public final class Store {
                     kind: ProcessGroupKind(rawValue: Self.text(statement, 3)) ?? .application,
                     footprint: UInt64(bitPattern: sqlite3_column_int64(statement, 4)),
                     processCount: Int(sqlite3_column_int64(statement, 5)),
-                    sessionCount: Int(sqlite3_column_int64(statement, 6))
+                    sessionCount: Int(sqlite3_column_int64(statement, 6)),
+                    hostFootprint: UInt64(bitPattern: sqlite3_column_int64(statement, 7)),
+                    hostProcessCount: Int(sqlite3_column_int64(statement, 8))
                 )
             }
+    }
+
+    /// Presence distinguishes a valid (possibly empty) new-collector sample
+    /// from a fresh system sample written by an older collector binary.
+    public func latestProcessGroupSnapshot() -> Double? {
+        query("SELECT ts FROM process_group_snapshot WHERE id = 1") {
+            sqlite3_column_double($0, 0)
+        }.first
+    }
+
+    public func processGroupSnapshotStatus(
+        now: Double,
+        staleAfter: Double = 20
+    ) -> ProcessGroupSnapshotStatus {
+        guard let snapshot = latestProcessGroupSnapshot() else { return .missing }
+        return snapshot >= now - staleAfter ? .fresh : .stale
     }
 
     public func sessionHistory(key: String, since: Double) -> [(time: Double, bytes: UInt64)] {

@@ -142,6 +142,13 @@ func runDoctor() {
     if storeExists, let store = openStore() {
         let fresh = storeIsFresh(store, now: Date().timeIntervalSince1970)
         check("store fresh (daemon sampling)", fresh, hint: "run rambar install-daemon")
+        if fresh {
+            check(
+                "collector supports process groups",
+                store.processGroupSnapshotStatus(now: Date().timeIntervalSince1970) == .fresh,
+                hint: "run the bundled rambar-cli install-daemon"
+            )
+        }
     }
 
     let loaded = launchctl(["print", "gui/\(getuid())/\(daemonLabel)"]).status == 0

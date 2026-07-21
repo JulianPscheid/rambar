@@ -44,6 +44,13 @@ open dist/Rambar.app                     # menu bar face
 
 `rambar doctor` verifies every layer. `rambar uninstall-daemon` removes the collector and keeps your data.
 
+When upgrading an existing installation, run the new bundled collector once so
+the background service and menu bar app stay on the same version:
+
+```bash
+/Applications/Rambar.app/Contents/MacOS/rambar-cli install-daemon
+```
+
 ## CLI
 
 ```

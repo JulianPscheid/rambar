@@ -16,6 +16,8 @@ final class FaceModel: ObservableObject {
     @Published var orphans: Store.OrphanState?
     @Published var rising: Set<String> = []
     @Published var collectorRunning = false
+    @Published var hasProcessGroupSnapshot = false
+    @Published var collectorNeedsUpdate = false
     @Published var sampledAgo: Double = .infinity
 
     /// Children shown when a session row expands, sampled on demand.
@@ -64,8 +66,11 @@ final class FaceModel: ObservableObject {
 
         let now = Date().timeIntervalSince1970
         let latest = store.latestSystem()
+        let processGroupStatus = store.processGroupSnapshotStatus(now: now)
         sampledAgo = latest.map { now - $0.ts } ?? .infinity
         collectorRunning = sampledAgo <= 20
+        hasProcessGroupSnapshot = processGroupStatus != .missing
+        collectorNeedsUpdate = collectorRunning && processGroupStatus != .fresh
 
         guard collectorRunning else {
             // Show whatever the store last knew, clearly marked stale by the footer.
@@ -74,6 +79,7 @@ final class FaceModel: ObservableObject {
             sessions = store.activeSessions(now: latest?.ts ?? now)
             history = store.systemHistory(since: now - 3_600)
             orphans = store.latestOrphanState()
+            reconcileExpansion()
             return
         }
 
@@ -82,6 +88,7 @@ final class FaceModel: ObservableObject {
         sessions = store.activeSessions(now: now)
         history = store.systemHistory(since: now - 3_600)
         orphans = store.latestOrphanState()
+        reconcileExpansion()
 
         var nowRising: Set<String> = []
         for session in sessions {
@@ -96,6 +103,19 @@ final class FaceModel: ObservableObject {
     }
 
     // MARK: - Expansion
+
+    private func reconcileExpansion() {
+        if let expandedGroupKey,
+           !processGroups.contains(where: { $0.key == expandedGroupKey }) {
+            self.expandedGroupKey = nil
+            expandedKey = nil
+            expandedChildren = []
+        } else if let expandedKey,
+                  !sessions.contains(where: { $0.key == expandedKey }) {
+            self.expandedKey = nil
+            expandedChildren = []
+        }
+    }
 
     func toggleExpansion(_ group: ProcessGroup) {
         guard group.family != nil else { return }

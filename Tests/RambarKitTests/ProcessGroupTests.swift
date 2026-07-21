@@ -12,7 +12,27 @@ final class ProcessGroupTests: XCTestCase {
         XCTAssertEqual(claude.sessionCount, 4)
         XCTAssertEqual(claude.processCount, 13)
         XCTAssertEqual(claude.footprint, 2_544 * 1_048_576)
+        XCTAssertEqual(claude.hostProcessCount, 4)
+        XCTAssertEqual(claude.hostFootprint, 482 * 1_048_576)
+        XCTAssertEqual(
+            trees.filter { $0.family == .claude }.reduce(claude.hostFootprint) { $0 + $1.footprint },
+            claude.footprint
+        )
         XCTAssertNil(groups.first { $0.displayName == "Node.js" }, "agent helpers must not be counted twice")
+    }
+
+    func testDesktopAppWithoutSessionsStaysAnApplicationGroup() throws {
+        let samples = [
+            Fixture.process(1, 0, Fixture.launchd),
+            Fixture.process(100, 1, Fixture.claudeDesktopUI, mb: 300),
+            Fixture.process(120, 100, Fixture.claudeDesktopHelper, mb: 180),
+        ]
+
+        let group = try XCTUnwrap(buildProcessGroups(samples: samples, sessionTrees: []).first)
+        XCTAssertEqual(group.displayName, "Claude")
+        XCTAssertEqual(group.kind, .application)
+        XCTAssertNil(group.family)
+        XCTAssertEqual(group.footprint, 480 * 1_048_576)
     }
 
     func testKnownApplicationsAndStandaloneRuntimesBecomePrimaryGroups() throws {
@@ -67,6 +87,22 @@ final class ProcessGroupTests: XCTestCase {
         let groups = buildProcessGroups(samples: large, sessionTrees: [])
         XCTAssertEqual(groups.map(\.displayName), ["Other"])
         XCTAssertEqual(groups[0].processCount, 1)
+
+        let boundary = [Fixture.process(10, 1, "/usr/libexec/unmatched", mb: 500)]
+        XCTAssertEqual(
+            buildProcessGroups(samples: boundary, sessionTrees: []).map(\.displayName),
+            ["Other"]
+        )
+    }
+
+    func testGenericBundleKeysDoNotMergePunctuationVariants() {
+        let groups = buildProcessGroups(samples: [
+            Fixture.process(10, 1, "/Applications/Foo Bar.app/Contents/MacOS/Foo Bar", mb: 100),
+            Fixture.process(11, 1, "/Applications/Foo-Bar.app/Contents/MacOS/Foo-Bar", mb: 100),
+        ], sessionTrees: [])
+
+        XCTAssertEqual(Set(groups.map(\.displayName)), ["Foo Bar", "Foo-Bar"])
+        XCTAssertEqual(Set(groups.map(\.key)).count, 2)
     }
 
     func testTinyApplicationGroupsStayOutOfThePrimaryList() {

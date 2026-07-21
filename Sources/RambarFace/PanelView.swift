@@ -20,8 +20,24 @@ struct PanelView: View {
 
             Divider()
 
-            if model.processGroups.isEmpty {
+            if model.collectorNeedsUpdate {
+                VStack(spacing: 5) {
+                    Text("collector update required")
+                        .font(.callout.weight(.medium))
+                    Text("Run the bundled rambar-cli install-daemon command")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 24)
+            } else if !model.hasProcessGroupSnapshot {
                 Text("waiting for process sample")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 28)
+            } else if model.processGroups.isEmpty {
+                Text("no significant process groups")
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity)
@@ -145,6 +161,9 @@ struct PanelView: View {
 
             if expanded {
                 VStack(alignment: .leading, spacing: 1) {
+                    if group.hostProcessCount > 0 {
+                        hostRow(group)
+                    }
                     ForEach(model.sessions(for: group), id: \.key) { session in
                         sessionRow(session)
                     }
@@ -159,6 +178,25 @@ struct PanelView: View {
                 .padding(.leading, 10)
             }
         }
+    }
+
+    private func hostRow(_ group: ProcessGroup) -> some View {
+        HStack(alignment: .center) {
+            VStack(alignment: .leading, spacing: 1) {
+                Text("desktop host")
+                    .font(.system(size: 13, weight: .medium))
+                Text("\(group.hostProcessCount) procs outside session trees")
+                    .font(.caption2)
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 12)
+            Text(formatBytes(group.hostFootprint))
+                .font(.system(size: 13, weight: .semibold))
+                .monospacedDigit()
+        }
+        .padding(.horizontal, 6)
+        .padding(.vertical, 5)
     }
 
     private func processGroupLabel(_ group: ProcessGroup, expanded: Bool) -> some View {
@@ -330,7 +368,7 @@ struct PanelView: View {
                 let named = dups.filter {
                     !$0.basename.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 }
-                ForEach(Array(named.prefix(3)), id: \.basename) { dup in
+                ForEach(Array(named.prefix(3)), id: \.stableKey) { dup in
                     Label {
                         Text("\(dup.basename) ×\(dup.count) · \(formatBytes(dup.footprint))")
                             .monospacedDigit()
@@ -355,7 +393,11 @@ struct PanelView: View {
 
     private var footer: some View {
         HStack {
-            if model.collectorRunning {
+            if model.collectorNeedsUpdate {
+                Label("collector update required", systemImage: "exclamationmark.triangle")
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+            } else if model.collectorRunning {
                 Text("sampled \(Int(max(model.sampledAgo, 0)))s ago")
                     .font(.caption2)
                     .monospacedDigit()
@@ -387,10 +429,13 @@ struct PanelView: View {
         let expandedSessions = model.processGroups.first { $0.key == model.expandedGroupKey }
             .map { model.sessions(for: $0).count } ?? 0
         let sessionRows = CGFloat(expandedSessions) * 38
+        let expandedHostCount = model.processGroups.first { $0.key == model.expandedGroupKey }?
+            .hostProcessCount ?? 0
+        let hostRows: CGFloat = expandedHostCount > 0 ? 38 : 0
         let childRows = model.expandedKey == nil
             ? 0
             : CGFloat(max(model.expandedChildren.count, 1)) * 20 + 10
-        return min(rows + sessionRows + childRows + 16, 380)
+        return min(rows + sessionRows + hostRows + childRows + 16, 380)
     }
 
     private let snapshotRowLimit = 12

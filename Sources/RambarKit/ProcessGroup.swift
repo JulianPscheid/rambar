@@ -18,6 +18,10 @@ public struct ProcessGroup: Hashable, Codable, Sendable {
     public let footprint: UInt64
     public let processCount: Int
     public let sessionCount: Int
+    /// Agent desktop-app processes that host, but are not descendants of,
+    /// the engine sessions represented by this group.
+    public let hostFootprint: UInt64
+    public let hostProcessCount: Int
 
     public init(
         key: String,
@@ -26,7 +30,9 @@ public struct ProcessGroup: Hashable, Codable, Sendable {
         kind: ProcessGroupKind,
         footprint: UInt64,
         processCount: Int,
-        sessionCount: Int
+        sessionCount: Int,
+        hostFootprint: UInt64 = 0,
+        hostProcessCount: Int = 0
     ) {
         self.key = key
         self.displayName = displayName
@@ -35,6 +41,8 @@ public struct ProcessGroup: Hashable, Codable, Sendable {
         self.footprint = footprint
         self.processCount = processCount
         self.sessionCount = sessionCount
+        self.hostFootprint = hostFootprint
+        self.hostProcessCount = hostProcessCount
     }
 }
 
@@ -150,12 +158,8 @@ private func applicationIdentity(for path: String) -> GroupIdentity? {
     let bundleName = String(component.dropLast(4))
     let normalized = bundleName.lowercased()
     let alias = appAliases[normalized]
-    let slug = normalized.map { character -> Character in
-        character.isLetter || character.isNumber ? character : "-"
-    }
-    let generatedKey = String(slug).split(separator: "-").joined(separator: "-")
     return GroupIdentity(
-        key: "app:\(alias?.key ?? generatedKey)",
+        key: "app:\(alias?.key ?? normalized)",
         displayName: alias?.displayName ?? bundleName,
         family: nil,
         kind: .application
@@ -190,6 +194,8 @@ public func buildProcessGroups(
     var identities: [String: GroupIdentity] = [:]
     var footprints: [String: UInt64] = [:]
     var counts: [String: Int] = [:]
+    var hostFootprints: [String: UInt64] = [:]
+    var hostCounts: [String: Int] = [:]
     var unmatchedFootprint: UInt64 = 0
     var unmatchedCount = 0
 
@@ -197,10 +203,18 @@ public func buildProcessGroups(
         let lowerPath = sample.execPath.lowercased()
         let basename = sample.executableBasename.lowercased()
         let groupIdentity: GroupIdentity?
+        var isHostProcess = false
 
-        if let family = ownedFamilyByPid[sample.pid]
-            ?? hostFamily(for: lowerPath)
-            ?? agentFamily(forExecutablePath: sample.execPath) {
+        if let family = ownedFamilyByPid[sample.pid] {
+            groupIdentity = identity(for: family)
+        } else if let family = hostFamily(for: lowerPath) {
+            if sessionCountByFamily[family, default: 0] > 0 {
+                groupIdentity = identity(for: family)
+                isHostProcess = true
+            } else {
+                groupIdentity = applicationIdentity(for: sample.execPath)
+            }
+        } else if let family = agentFamily(forExecutablePath: sample.execPath) {
             groupIdentity = identity(for: family)
         } else if let application = applicationIdentity(for: sample.execPath) {
             groupIdentity = application
@@ -216,9 +230,13 @@ public func buildProcessGroups(
         identities[groupIdentity.key] = groupIdentity
         footprints[groupIdentity.key, default: 0] += sample.footprint
         counts[groupIdentity.key, default: 0] += 1
+        if isHostProcess {
+            hostFootprints[groupIdentity.key, default: 0] += sample.footprint
+            hostCounts[groupIdentity.key, default: 0] += 1
+        }
     }
 
-    if unmatchedFootprint > otherThresholdBytes {
+    if unmatchedFootprint >= otherThresholdBytes {
         let other = GroupIdentity(key: "other", displayName: "Other", family: nil, kind: .other)
         identities[other.key] = other
         footprints[other.key] = unmatchedFootprint
@@ -233,7 +251,9 @@ public func buildProcessGroups(
             kind: identity.kind,
             footprint: footprints[identity.key] ?? 0,
             processCount: counts[identity.key] ?? 0,
-            sessionCount: identity.family.flatMap { sessionCountByFamily[$0] } ?? 0
+            sessionCount: identity.family.flatMap { sessionCountByFamily[$0] } ?? 0,
+            hostFootprint: hostFootprints[identity.key] ?? 0,
+            hostProcessCount: hostCounts[identity.key] ?? 0
         )
     }
     .filter {

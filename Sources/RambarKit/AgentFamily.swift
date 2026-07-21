@@ -34,7 +34,16 @@ public func agentFamily(forExecutablePath path: String) -> AgentFamily? {
     // The standalone installer currently points ~/.local/bin/claude at a
     // version-named executable (for example .../versions/2.1.216). libproc
     // resolves the symlink, so the basename is not necessarily "claude".
-    if lower.contains("/.local/share/claude/versions/") { return .claude }
+    let versionMarker = "/.local/share/claude/versions/"
+    if let range = lower.range(of: versionMarker) {
+        let components = lower[range.upperBound...].split(separator: "/")
+        if let version = components.first,
+           version.first?.isNumber == true,
+           version.allSatisfy({ $0.isNumber || $0 == "." || $0 == "-" }),
+           (components.count == 1 || (components.count == 2 && components[1] == "claude")) {
+            return .claude
+        }
+    }
 
     if basename == "claude" {
         // Desktop-hosted engine lives inside a claude.app bundle, but under a

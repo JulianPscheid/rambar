@@ -18,6 +18,12 @@ final class AgentFamilyTests: XCTestCase {
         )
     }
 
+    func testVersionedClaudeDirectoryDoesNotMatchNestedHelpers() {
+        XCTAssertNil(agentFamily(forExecutablePath:
+            "/Users/dev/.local/share/claude/versions/2.1.216/helpers/worker"
+        ))
+    }
+
     func testClaudeDesktopUIDoesNotMatch() {
         XCTAssertNil(agentFamily(forExecutablePath: Fixture.claudeDesktopUI))
     }
