@@ -36,5 +36,11 @@ cat > "$app/Contents/Info.plist" << 'PLIST'
 </plist>
 PLIST
 
+# Ship the CLI inside the bundle so the Homebrew cask can link it as a
+# binary. Named rambar-cli: on case-insensitive APFS, "rambar" IS the app
+# executable "Rambar".
+cp "$root/.build/$configuration/rambar" "$app/Contents/MacOS/rambar-cli"
+
+codesign --force --sign - "$app/Contents/MacOS/rambar-cli"
 codesign --force --sign - "$app"
 echo "bundled $app"

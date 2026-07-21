@@ -16,20 +16,17 @@ jobs:
         with:
           fetch-depth: 0  # Need full history for release notes
 
-      - name: Build app
+      - name: Build and bundle
         run: |
-          cd RAMBar
-          xcodebuild -scheme RAMBar -configuration Release -derivedDataPath build build
+          swift build -c release
+          scripts/bundle-app.sh release
 
       - name: Create zip
-        run: |
-          cd RAMBar/build/Build/Products/Release
-          zip -r RAMBar.zip RAMBar.app
+        run: ditto -c -k --keepParent dist/Rambar.app Rambar.zip
 
       - name: Generate release notes
         id: notes
         run: |
-          # Get previous tag
           PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
 
           if [ -z "$PREV_TAG" ]; then
@@ -38,21 +35,20 @@ jobs:
             NOTES=$(git log ${PREV_TAG}..HEAD --pretty=format:"- %s" --no-merges)
           fi
 
-          # Write to file for multiline handling
           echo "$NOTES" > release_notes.txt
 
       - name: Create GitHub Release
         run: |
           gh release create ${{ github.ref_name }} \
-            RAMBar/build/Build/Products/Release/RAMBar.zip \
-            --title "RAMBar ${{ github.ref_name }}" \
+            Rambar.zip \
+            --title "Rambar ${{ github.ref_name }}" \
             --notes-file release_notes.txt
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Update Homebrew tap
         run: |
-          SHA=$(shasum -a 256 RAMBar/build/Build/Products/Release/RAMBar.zip | cut -d' ' -f1)
+          SHA=$(shasum -a 256 Rambar.zip | cut -d' ' -f1)
           VERSION="${{ github.ref_name }}"
           VERSION="${VERSION#v}"  # Remove 'v' prefix
 
@@ -64,14 +60,19 @@ jobs:
             version "$VERSION"
             sha256 "$SHA"
 
-            url "https://github.com/MaxGhenis/rambar/releases/download/v#{version}/RAMBar.zip"
-            name "RAMBar"
-            desc "Retro-styled menu bar RAM monitor for macOS"
-            homepage "https://github.com/MaxGhenis/rambar"
+            url "https://github.com/MaxGhenis/rambar/releases/download/v#{version}/Rambar.zip"
+            name "Rambar"
+            desc "Menu bar RAM monitor for agent sessions"
+            homepage "https://maxghenis.com/rambar"
 
-            app "RAMBar.app"
+            app "Rambar.app"
+            binary "#{appdir}/Rambar.app/Contents/MacOS/rambar-cli", target: "rambar"
+
+            uninstall launchctl: "com.maxghenis.rambar.collector"
 
             zap trash: [
+              "~/.rambar",
+              "~/Library/LaunchAgents/com.maxghenis.rambar.collector.plist",
               "~/Library/Preferences/com.maxghenis.RAMBar.plist",
             ]
           end
