@@ -327,6 +327,11 @@ final class FaceModel: ObservableObject {
 
     var attributedTotal: UInt64 { sessions.reduce(0) { $0 + $1.footprint } }
 
+    var menuBarSymbolName: String {
+        if !pausedSessionKeys.isEmpty { return "pause.circle.fill" }
+        return pressure == .normal ? "memorychip" : "memorychip.fill"
+    }
+
     var familyGroups: [(family: AgentFamily, sessions: [SessionRecord])] {
         AgentFamily.allCases.compactMap { family in
             let members = sessions.filter { $0.family == family }

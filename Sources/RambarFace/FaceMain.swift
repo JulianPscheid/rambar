@@ -69,12 +69,13 @@ struct RambarFaceApp: App {
         } label: {
             // Template rendering keeps menu bar icons monochrome; state is
             // encoded in the symbol itself, not a color that would be lost.
-            let symbolName = model.pressure == .normal ? "memorychip" : "memorychip.fill"
+            // A paused session needs action even after pressure recovers, so
+            // it takes precedence over the normal pressure-state chip.
             Label {
                 Text(model.usedPercentText)
                     .monospacedDigit()
             } icon: {
-                Image(nsImage: menuBarSymbol(named: symbolName))
+                Image(nsImage: menuBarSymbol(named: model.menuBarSymbolName))
             }
             .labelStyle(.titleAndIcon)
         }
