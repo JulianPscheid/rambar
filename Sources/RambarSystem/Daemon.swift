@@ -9,6 +9,7 @@ public enum EventKind {
     public static let sessionStarted = "session_started"
     public static let sessionEnded = "session_ended"
     public static let attention = "attention"
+    public static let runawayPaused = "runaway_paused"
 }
 
 /// The 5-second sampling loop. Single-threaded over its own store connection;
@@ -18,6 +19,7 @@ public final class Daemon {
     private let store: Store
     private let home: String
     private let index: SessionIndex
+    private let runawayGuardSettingsPath: String
     private let queue = DispatchQueue(label: "org.rambar.daemon")
     private let interval: TimeInterval
 
@@ -29,14 +31,21 @@ public final class Daemon {
     private var lastPressure: PressureLevel = .normal
     private var knownSessionKeys: Set<String> = []
     private var attentionKeys: Set<String> = []
+    private var runawayGuard = RunawayGuard()
     private var ticksSinceCompaction = 0
-    private var lastSystem: SystemMemorySnapshot?
 
-    public init(store: Store, home: String = NSHomeDirectory(), interval: TimeInterval = 5) {
+    public init(
+        store: Store,
+        home: String = NSHomeDirectory(),
+        interval: TimeInterval = 5,
+        runawayGuardSettingsPath: String? = nil
+    ) {
         self.store = store
         self.home = home
         self.index = SessionIndex(home: home)
         self.interval = interval
+        self.runawayGuardSettingsPath = runawayGuardSettingsPath
+            ?? RunawayGuardSettings.defaultPath(home: home)
     }
 
     /// Runs forever. SIGTERM/SIGINT exit cleanly via signal sources.
@@ -68,6 +77,35 @@ public final class Daemon {
         let now = Date().timeIntervalSince1970
         let samples = collectProcessSamples()
         let trees = buildSessionTrees(samples)
+        let system = collectSystemMemory()
+        let settings = RunawayGuardSettings.load(from: runawayGuardSettingsPath)
+        let incidents = system.map {
+            runawayGuard.evaluate(
+                now: now,
+                totalMemory: $0.total,
+                pressure: $0.pressure,
+                trees: trees,
+                settings: settings
+            )
+        } ?? []
+        let interventions: [(RunawayIncident, SessionInterventionResult)] =
+            incidents.compactMap { incident in
+                if processIsStopped(incident.root) == true {
+                    runawayGuard.markContained(sessionKey: incident.sessionKey)
+                    return nil
+                }
+                let result = performSessionIntervention(
+                    root: incident.root,
+                    action: RunawayGuard.automaticAction,
+                    trees: trees,
+                    identityLookup: processIdentity,
+                    sendSignal: kill
+                )
+                if result.signaledProcessCount > 0 && result.failedProcessCount == 0 {
+                    runawayGuard.markContained(sessionKey: incident.sessionKey)
+                }
+                return result.signaledProcessCount > 0 ? (incident, result) : nil
+            }
         let processGroups = buildProcessGroups(samples: samples, sessionTrees: trees)
         let orphanReport = tracker.update(samples: samples, trees: trees)
 
@@ -114,10 +152,27 @@ public final class Daemon {
             try store.recordOrphanState(
                 ts: now, report: orphanReport, duplicates: findDuplicates(in: trees)
             )
-            if let system = collectSystemMemory() {
-                lastSystem = system
+            if let system {
                 try store.record(ts: now, system: system)
                 notePressure(system.pressure, viaEvent: false)
+            }
+
+            for (incident, result) in interventions {
+                let tree = trees.first { $0.key == incident.sessionKey }
+                try store.recordEvent(
+                    ts: now,
+                    kind: EventKind.runawayPaused,
+                    payload: jsonObject([
+                        "key": incident.sessionKey,
+                        "project": tree?.projectName(home: home) ?? "unknown",
+                        "reason": incident.reason.rawValue,
+                        "root_pid": "\(incident.root.pid)",
+                        "largest_pid": "\(incident.largestProcess.pid)",
+                        "largest_footprint": "\(incident.largestProcessFootprint)",
+                        "session_footprint": "\(incident.sessionFootprint)",
+                        "signaled": "\(result.signaledProcessCount)",
+                    ])
+                )
             }
 
             let currentKeys = Set(trees.map(\.key))

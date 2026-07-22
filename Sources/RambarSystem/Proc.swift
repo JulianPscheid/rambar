@@ -19,6 +19,7 @@ enum Proc {
     struct BasicInfo {
         let ppid: Int32
         let startTime: Double
+        let status: Int32
     }
 
     static func basicInfo(_ pid: Int32) -> BasicInfo? {
@@ -26,7 +27,11 @@ enum Proc {
         let size = Int32(MemoryLayout<proc_bsdinfo>.size)
         guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size) == size else { return nil }
         let start = Double(info.pbi_start_tvsec) + Double(info.pbi_start_tvusec) / 1_000_000
-        return BasicInfo(ppid: Int32(bitPattern: info.pbi_ppid), startTime: start)
+        return BasicInfo(
+            ppid: Int32(bitPattern: info.pbi_ppid),
+            startTime: start,
+            status: Int32(info.pbi_status)
+        )
     }
 
     static func executablePath(_ pid: Int32) -> String? {
