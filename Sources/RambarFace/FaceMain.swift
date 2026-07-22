@@ -16,6 +16,12 @@ struct RambarFaceApp: App {
            CommandLine.arguments.count > flagIndex + 1 {
             let path = CommandLine.arguments[flagIndex + 1]
             model.refresh()
+            if CommandLine.arguments.contains("--snapshot-expanded") {
+                expandFirstSession(
+                    model: model,
+                    showPaused: CommandLine.arguments.contains("--snapshot-paused")
+                )
+            }
             renderSnapshot(model: model, to: path)
             exit(0)
         }
@@ -94,6 +100,17 @@ private func menuBarSymbol(named name: String) -> NSImage {
     }
     image.isTemplate = true
     return image
+}
+
+@MainActor
+private func expandFirstSession(model: FaceModel, showPaused: Bool) {
+    guard let group = model.processGroups.first(where: { $0.family != nil }),
+          let session = model.sessions(for: group).first else { return }
+    model.toggleExpansion(group)
+    model.toggleExpansion(session)
+    if showPaused {
+        model.pausedSessionKeys.insert(session.key)
+    }
 }
 
 @MainActor

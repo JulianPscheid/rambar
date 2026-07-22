@@ -385,7 +385,8 @@ struct PanelView: View {
                         in: RoundedRectangle(cornerRadius: 6))
 
             if expanded {
-                VStack(alignment: .leading, spacing: 3) {
+                VStack(alignment: .leading, spacing: 6) {
+                    sessionControls(session)
                     if let id = session.sessionID {
                         HStack(alignment: .firstTextBaseline, spacing: 6) {
                             Text("session ID")
@@ -395,15 +396,10 @@ struct PanelView: View {
                                 .textSelection(.enabled)
                         }
                         .font(.caption2)
-                        .padding(.bottom, 2)
                     }
-                    sessionControls(session)
-                        .padding(.bottom, 2)
-                    if let message = model.interventionMessages[session.key] {
-                        Text(message)
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                    }
+                    Text("largest processes")
+                        .font(.caption2.weight(.medium))
+                        .foregroundStyle(.tertiary)
                     ForEach(model.expandedProcesses, id: \.pid) { process in
                         HStack {
                             Text(process.commandLabel)
@@ -430,20 +426,80 @@ struct PanelView: View {
 
     private func sessionControls(_ session: SessionRecord) -> some View {
         let busy = model.interveningKeys.contains(session.key)
-        return HStack(spacing: 12) {
-            Button("Interrupt") { model.intervene(session, action: .interrupt) }
+        let paused = model.pausedSessionKeys.contains(session.key)
+        return VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Label(
+                    paused ? "Session paused" : "Session controls",
+                    systemImage: paused ? "pause.circle.fill" : "switch.2"
+                )
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(paused ? .orange : .secondary)
+                Spacer()
+                if busy {
+                    ProgressView()
+                        .controlSize(.small)
+                }
+            }
+
+            HStack(spacing: 6) {
+                Button {
+                    model.intervene(session, action: .interrupt)
+                } label: {
+                    Label("Interrupt", systemImage: "stop.circle")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
                 .help("Send SIGINT to the agent root, like pressing Control-C")
-            Button("Pause") { model.intervene(session, action: .pause) }
-                .help("Send SIGSTOP to this session's verified process tree")
-            Button("Resume") { model.intervene(session, action: .resume) }
-                .help("Send SIGCONT to this session's verified process tree")
-            Button("End…") { pendingEndKey = session.key }
-                .foregroundStyle(.orange)
+
+                if paused {
+                    Button {
+                        model.intervene(session, action: .resume)
+                    } label: {
+                        Label("Resume", systemImage: "play.fill")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.green)
+                    .help("Resume this session's verified process tree")
+                } else {
+                    Button {
+                        model.intervene(session, action: .pause)
+                    } label: {
+                        Label("Pause", systemImage: "pause.fill")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(.orange)
+                    .help("Pause this session's verified process tree")
+                }
+
+                Button {
+                    pendingEndKey = session.key
+                } label: {
+                    Label("End", systemImage: "power")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .tint(.red)
                 .help("Ask this session's verified process tree to terminate")
+            }
+            .font(.caption.weight(.medium))
+            .controlSize(.small)
+            .disabled(busy)
+
+            if let message = model.interventionMessages[session.key] {
+                Text(message)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
         }
-        .font(.caption2.weight(.medium))
-        .buttonStyle(.plain)
-        .disabled(busy)
+        .padding(8)
+        .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 7))
+        .overlay {
+            RoundedRectangle(cornerRadius: 7)
+                .stroke(.quaternary, lineWidth: 1)
+        }
     }
 
     private func subtitle(for session: SessionRecord) -> String {
