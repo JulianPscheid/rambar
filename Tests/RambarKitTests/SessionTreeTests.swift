@@ -50,6 +50,58 @@ final class SessionTreeTests: XCTestCase {
         XCTAssertTrue(alpha.members.contains { $0.pid == 105 })
     }
 
+    func testDetachedDaemonJoinsSessionNamedBySpawnedByPID() throws {
+        let samples = [
+            Fixture.process(1, 0, Fixture.launchd, start: 0),
+            Fixture.process(10, 1, Fixture.cliEngine, cwd: "/Users/dev/project", mb: 100, start: 100),
+            Fixture.process(
+                20, 1, Fixture.cliEngine, cwd: Fixture.home, mb: 200, start: 110,
+                agentOwnerPID: 10, isAgentInfrastructure: true
+            ),
+            Fixture.process(21, 20, Fixture.node, mb: 300, start: 120),
+        ]
+
+        let tree = try XCTUnwrap(buildSessionTrees(samples).first)
+        XCTAssertEqual(tree.root.pid, 10)
+        XCTAssertEqual(Set(tree.members.map(\.pid)), [10, 20, 21])
+        XCTAssertEqual(tree.footprint, 600 * 1_048_576)
+    }
+
+    func testReusedDeclaredOwnerPIDCannotClaimOlderDaemon() throws {
+        let samples = [
+            Fixture.process(1, 0, Fixture.launchd, start: 0),
+            Fixture.process(10, 1, Fixture.cliEngine, cwd: "/Users/dev/new", mb: 100, start: 200),
+            Fixture.process(
+                20, 1, Fixture.cliEngine, cwd: Fixture.home, mb: 200, start: 100,
+                agentOwnerPID: 10, isAgentInfrastructure: true
+            ),
+            Fixture.process(21, 20, Fixture.node, mb: 300, start: 110),
+        ]
+
+        let tree = try XCTUnwrap(buildSessionTrees(samples).first)
+        XCTAssertEqual(tree.root.pid, 10)
+        XCTAssertEqual(Set(tree.members.map(\.pid)), [10],
+                       "an older daemon must not attach to a reused owner pid")
+    }
+
+    func testBackgroundSpareAndUnownedDaemonAreNotSessions() {
+        let samples = [
+            Fixture.process(1, 0, Fixture.launchd, start: 0),
+            Fixture.process(
+                20, 1, Fixture.cliEngine, cwd: Fixture.home, mb: 200, start: 110,
+                agentOwnerPID: 999, isAgentInfrastructure: true
+            ),
+            Fixture.process(21, 20, Fixture.node, mb: 300, start: 120),
+            Fixture.process(
+                30, 1, Fixture.cliEngine, cwd: "/tmp/spare", mb: 400, start: 130,
+                isAgentInfrastructure: true
+            ),
+            Fixture.process(31, 30, Fixture.node, mb: 500, start: 140),
+        ]
+
+        XCTAssertTrue(buildSessionTrees(samples).isEmpty)
+    }
+
     func testParentCycleDoesNotHang() {
         let cyclic = [
             Fixture.process(10, 11, Fixture.cliEngine, mb: 100),

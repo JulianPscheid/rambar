@@ -24,12 +24,26 @@ public enum AgentFamily: String, CaseIterable, Codable, Sendable {
 ///
 /// Claude has three launch shapes, all verified against live processes:
 /// - Desktop-hosted engine: …/Application Support/Claude/claude-code/<ver>/claude.app/Contents/MacOS/claude
-/// - Standalone CLI: ~/.local/share/claude/versions/<ver>/claude (or any binary named claude)
+/// - Standalone CLI: ~/.local/share/claude/versions/<ver> (the resolved binary can be version-named)
 /// - The Claude Desktop UI itself (/Applications/Claude.app/Contents/MacOS/Claude
 ///   and its Frameworks helpers) is NOT an engine and must not match.
 public func agentFamily(forExecutablePath path: String) -> AgentFamily? {
     let lower = path.lowercased()
     let basename = (lower as NSString).lastPathComponent
+
+    // The standalone installer currently points ~/.local/bin/claude at a
+    // version-named executable (for example .../versions/2.1.216). libproc
+    // resolves the symlink, so the basename is not necessarily "claude".
+    let versionMarker = "/.local/share/claude/versions/"
+    if let range = lower.range(of: versionMarker) {
+        let components = lower[range.upperBound...].split(separator: "/")
+        if let version = components.first,
+           version.first?.isNumber == true,
+           version.allSatisfy({ $0.isNumber || $0 == "." || $0 == "-" }),
+           (components.count == 1 || (components.count == 2 && components[1] == "claude")) {
+            return .claude
+        }
+    }
 
     if basename == "claude" {
         // Desktop-hosted engine lives inside a claude.app bundle, but under a

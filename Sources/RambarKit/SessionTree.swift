@@ -4,7 +4,7 @@ import Foundation
 /// TTY state, which goes stale when terminals close and is absent for
 /// desktop-app and SDK sessions entirely.
 public enum SessionMode: String, Codable, Sendable {
-    case desktop   // an ancestor is the Claude Desktop app
+    case desktop   // an ancestor is the agent's desktop app
     case terminal  // an ancestor is a terminal emulator, tmux, or an editor
     case headless  // reached launchd without either marker (lanes, cron, SDK)
 
@@ -76,11 +76,28 @@ public func buildSessionTrees(_ samples: [ProcessSample]) -> [AgentSessionTree] 
         byPid[sample.pid] = byPid[sample.pid] ?? sample
     }
 
+    /// Prefer an agent-declared ownership edge when it points to an older
+    /// engine of the same family. Otherwise use the kernel parent unchanged.
+    func parent(of child: ProcessSample) -> ProcessSample? {
+        if let ownerPID = child.agentOwnerPID,
+           ownerPID != child.pid,
+           let owner = byPid[ownerPID],
+           agentFamily(forExecutablePath: owner.execPath)
+                == agentFamily(forExecutablePath: child.execPath),
+           agentFamily(forExecutablePath: owner.execPath) != nil,
+           isPlausibleParent(owner, of: child) {
+            return owner
+        }
+        guard child.ppid > 0,
+              let parent = byPid[child.ppid],
+              isPlausibleParent(parent, of: child) else { return nil }
+        return parent
+    }
+
     func hasEngineAncestor(_ sample: ProcessSample) -> Bool {
         var child = sample
         var visited: Set<Int32> = [sample.pid]
-        while child.ppid > 0, visited.insert(child.ppid).inserted,
-              let parent = byPid[child.ppid], isPlausibleParent(parent, of: child) {
+        while let parent = parent(of: child), visited.insert(parent.pid).inserted {
             if agentFamily(forExecutablePath: parent.execPath) != nil { return true }
             child = parent
         }
@@ -90,6 +107,7 @@ public func buildSessionTrees(_ samples: [ProcessSample]) -> [AgentSessionTree] 
     let roots = samples.filter { sample in
         sample.pid > 0
             && agentFamily(forExecutablePath: sample.execPath) != nil
+            && !sample.isAgentInfrastructure
             && !hasEngineAncestor(sample)
     }
     let rootPids = Set(roots.map(\.pid))
@@ -103,9 +121,7 @@ public func buildSessionTrees(_ samples: [ProcessSample]) -> [AgentSessionTree] 
                 membersByRoot[current.pid, default: []].append(sample)
                 break
             }
-            guard current.ppid > 0,
-                  let parent = byPid[current.ppid],
-                  isPlausibleParent(parent, of: current) else { break }
+            guard let parent = parent(of: current) else { break }
             current = parent
         }
     }
@@ -113,10 +129,10 @@ public func buildSessionTrees(_ samples: [ProcessSample]) -> [AgentSessionTree] 
     func mode(of root: ProcessSample) -> SessionMode {
         var child = root
         var visited: Set<Int32> = [root.pid]
-        while child.ppid > 0, visited.insert(child.ppid).inserted,
-              let parent = byPid[child.ppid], isPlausibleParent(parent, of: child) {
+        while let parent = parent(of: child), visited.insert(parent.pid).inserted {
             let lower = parent.execPath.lowercased()
-            if lower.contains("/applications/claude.app/") { return .desktop }
+            if lower.contains("/applications/claude.app/")
+                || lower.contains("/applications/codex.app/") { return .desktop }
             if isTerminalAncestor((lower as NSString).lastPathComponent) { return .terminal }
             child = parent
         }

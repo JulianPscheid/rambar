@@ -33,18 +33,9 @@ func liveSessions(now: Double) -> [SessionRecord] {
     let home = NSHomeDirectory()
     let index = SessionIndex(home: home)
     let trees = buildSessionTrees(collectProcessSamples())
-    let unambiguous = keysWithUnambiguousCwd(trees)
+    let identities = index.identities(for: trees)
     return trees.map { tree in
-        var sessionID: String?
-        var title: String?
-        if unambiguous.contains(tree.key) {
-            sessionID = index.sessionID(
-                family: tree.family, cwd: tree.root.cwd, rootStart: tree.root.startTime
-            )
-            if let sessionID {
-                title = index.title(family: tree.family, cwd: tree.root.cwd, sessionID: sessionID)
-            }
-        }
+        let identity = identities[tree.key]
         return SessionRecord(
             key: tree.key,
             family: tree.family,
@@ -53,8 +44,8 @@ func liveSessions(now: Double) -> [SessionRecord] {
             mode: tree.mode,
             rootPid: tree.root.pid,
             rootStart: tree.root.startTime,
-            sessionID: sessionID,
-            title: title,
+            sessionID: identity?.sessionID,
+            title: identity?.title,
             firstSeen: now,
             lastSeen: now,
             footprint: tree.footprint,

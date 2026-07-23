@@ -12,6 +12,17 @@ public struct ProcessSample: Hashable, Sendable {
     /// from argv[1]; nil otherwise. Lets dedup distinguish two MCP servers
     /// that are both "node" at the binary level.
     public let scriptPath: String?
+    /// A session ID exposed explicitly by a supported agent resume command.
+    /// This is only a hint; SessionIndex validates it against local metadata.
+    public let sessionIDHint: String?
+    /// An agent-declared ownership edge used when a helper daemon detaches
+    /// from its chat's OS process tree. The tree builder validates the target
+    /// family and start time before trusting it.
+    public let agentOwnerPID: Int32?
+    /// True for an agent engine that provides shared infrastructure rather
+    /// than representing a conversation, such as Claude's daemon and spare
+    /// PTY host.
+    public let isAgentInfrastructure: Bool
     public let cwd: String?
     /// Physical footprint in bytes (ri_phys_footprint), the same per-process
     /// attribution Activity Monitor's Memory column reports.
@@ -25,6 +36,9 @@ public struct ProcessSample: Hashable, Sendable {
         ppid: Int32,
         execPath: String,
         scriptPath: String? = nil,
+        sessionIDHint: String? = nil,
+        agentOwnerPID: Int32? = nil,
+        isAgentInfrastructure: Bool = false,
         cwd: String? = nil,
         footprint: UInt64 = 0,
         startTime: Double = 0
@@ -33,6 +47,9 @@ public struct ProcessSample: Hashable, Sendable {
         self.ppid = ppid
         self.execPath = execPath
         self.scriptPath = scriptPath
+        self.sessionIDHint = sessionIDHint
+        self.agentOwnerPID = agentOwnerPID
+        self.isAgentInfrastructure = isAgentInfrastructure
         self.cwd = cwd
         self.footprint = footprint
         self.startTime = startTime

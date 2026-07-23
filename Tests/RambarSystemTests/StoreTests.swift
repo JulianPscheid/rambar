@@ -85,6 +85,103 @@ final class StoreTests: XCTestCase {
         XCTAssertEqual(store.activeSessions(now: 1_100).count, 0)
     }
 
+    func testProcessGroupsRoundTripAndBecomeStale() throws {
+        let groups = [
+            ProcessGroup(
+                key: "agent:claude", displayName: "Claude Code", family: .claude,
+                kind: .agent, footprint: 900 * 1_048_576, processCount: 12, sessionCount: 3,
+                hostFootprint: 100 * 1_048_576, hostProcessCount: 2
+            ),
+            ProcessGroup(
+                key: "app:chrome", displayName: "Chrome", family: nil,
+                kind: .application, footprint: 800 * 1_048_576, processCount: 8, sessionCount: 0
+            ),
+        ]
+        try store.record(ts: 1_000, processGroups: groups)
+
+        let active = store.activeProcessGroups(now: 1_005)
+        XCTAssertEqual(active.map(\.key), ["agent:claude", "app:chrome"])
+        XCTAssertEqual(active[0].family, .claude)
+        XCTAssertEqual(active[0].sessionCount, 3)
+        XCTAssertEqual(active[0].hostFootprint, 100 * 1_048_576)
+        XCTAssertEqual(active[0].hostProcessCount, 2)
+        XCTAssertEqual(store.latestProcessGroupSnapshot(), 1_000)
+        XCTAssertEqual(store.processGroupSnapshotStatus(now: 1_005), .fresh)
+        XCTAssertEqual(store.processGroupSnapshotStatus(now: 1_100), .stale)
+        XCTAssertTrue(store.activeProcessGroups(now: 1_100).isEmpty)
+    }
+
+    func testEmptyProcessGroupSnapshotRetiresAbsentGroups() throws {
+        let chrome = ProcessGroup(
+            key: "app:chrome", displayName: "Chrome", family: nil,
+            kind: .application, footprint: 800 * 1_048_576, processCount: 8, sessionCount: 0
+        )
+        try store.record(ts: 1_000, processGroups: [chrome])
+        try store.record(ts: 1_005, processGroups: [])
+
+        XCTAssertEqual(store.latestProcessGroupSnapshot(), 1_005)
+        XCTAssertTrue(store.activeProcessGroups(now: 1_006).isEmpty)
+    }
+
+    func testNewStoreHasNoProcessGroupSnapshotCapability() {
+        XCTAssertNil(store.latestProcessGroupSnapshot())
+        XCTAssertEqual(store.processGroupSnapshotStatus(now: 1_000), .missing)
+    }
+
+    func testPreSnapshotDatabaseMigratesWithoutLosingProcessGroups() throws {
+        store = nil
+        try FileManager.default.removeItem(atPath: path)
+
+        var legacyDatabase: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(path, &legacyDatabase), SQLITE_OK)
+        let createLegacyTable = """
+            CREATE TABLE process_group(
+                key TEXT PRIMARY KEY,
+                display_name TEXT NOT NULL,
+                family TEXT,
+                kind TEXT NOT NULL,
+                last_seen REAL NOT NULL,
+                footprint INTEGER NOT NULL,
+                procs INTEGER NOT NULL,
+                sessions INTEGER NOT NULL
+            )
+            """
+        XCTAssertEqual(sqlite3_exec(legacyDatabase, createLegacyTable, nil, nil, nil), SQLITE_OK)
+        XCTAssertEqual(sqlite3_close(legacyDatabase), SQLITE_OK)
+
+        store = try Store(path: path)
+        XCTAssertEqual(store.processGroupSnapshotStatus(now: 1_000), .missing)
+
+        let chrome = ProcessGroup(
+            key: "app:chrome", displayName: "Chrome", family: nil,
+            kind: .application, footprint: 800 * 1_048_576, processCount: 8, sessionCount: 0
+        )
+        try store.record(ts: 1_000, processGroups: [chrome])
+
+        XCTAssertEqual(store.activeProcessGroups(now: 1_005).map(\.key), ["app:chrome"])
+    }
+
+    func testDuplicateHelpersKeepDistinctCommandPathIdentities() throws {
+        let duplicates = [
+            DuplicateGroup(commandPath: "/a/index.js", count: 3, footprint: 400 * 1_048_576),
+            DuplicateGroup(commandPath: "/b/index.js", count: 4, footprint: 500 * 1_048_576),
+        ]
+        try store.recordOrphanState(ts: 1_000, report: .empty, duplicates: duplicates)
+
+        let stored = try XCTUnwrap(store.latestOrphanState()).duplicates
+        XCTAssertEqual(stored.map(\.basename), ["index.js", "index.js"])
+        XCTAssertEqual(Set(stored.map(\.stableKey)).count, 2)
+        XCTAssertEqual(Set(stored.compactMap(\.commandPath)), ["/a/index.js", "/b/index.js"])
+    }
+
+    func testLegacyDuplicateJSONWithoutCommandPathStillDecodes() throws {
+        let data = Data(#"[{"basename":"index.js","count":3,"footprint":400}]"#.utf8)
+        let decoded = try JSONDecoder().decode([Store.DuplicateJSON].self, from: data)
+
+        XCTAssertNil(decoded[0].commandPath)
+        XCTAssertEqual(decoded[0].stableKey, "index.js:3:400")
+    }
+
     func testHistoryAndSlope() throws {
         let alpha = tree(pid: 50, project: "alpha", mb: 100)
         for step in 0..<10 {

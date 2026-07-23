@@ -108,26 +108,128 @@ func scriptPath(fromArguments arguments: [String]) -> String? {
     return nil
 }
 
+/// Extract a stable session ID only from agent command forms whose argument
+/// semantics are known. Arbitrary UUIDs elsewhere in argv are ignored.
+func agentSessionIDHint(family: AgentFamily, arguments: [String]) -> String? {
+    func validUUID(_ value: String) -> String? {
+        UUID(uuidString: value) == nil ? nil : value.lowercased()
+    }
+
+    switch family {
+    case .claude:
+        for (index, argument) in arguments.enumerated() {
+            if argument == "--resume" || argument == "--session-id" {
+                guard arguments.indices.contains(index + 1) else { return nil }
+                return validUUID(arguments[index + 1])
+            }
+            for prefix in ["--resume=", "--session-id="] where argument.hasPrefix(prefix) {
+                return validUUID(String(argument.dropFirst(prefix.count)))
+            }
+        }
+    case .codex:
+        if let resume = arguments.firstIndex(of: "resume"),
+           arguments.indices.contains(resume + 1) {
+            return validUUID(arguments[resume + 1])
+        }
+    case .gemini:
+        break
+    }
+    return nil
+}
+
+struct AgentProcessMetadata: Equatable, Sendable {
+    let ownerPID: Int32?
+    let isInfrastructure: Bool
+
+    static let none = AgentProcessMetadata(ownerPID: nil, isInfrastructure: false)
+}
+
+/// Parse only agent-owned process forms observed in the live CLI. A detached
+/// Claude daemon carries a JSON `--spawned-by` record pointing back to its
+/// chat root; a background spare is shared infrastructure with no chat yet.
+func agentProcessMetadata(
+    family: AgentFamily,
+    arguments: [String]
+) -> AgentProcessMetadata {
+    guard family == .claude else { return .none }
+
+    let isDaemon = arguments.count >= 3
+        && arguments[1] == "daemon"
+        && arguments[2] == "run"
+    let isSpare = arguments.contains("--bg-spare")
+    guard isDaemon || isSpare else { return .none }
+
+    var spawnedBy: String?
+    for (index, argument) in arguments.enumerated() {
+        if argument == "--spawned-by", arguments.indices.contains(index + 1) {
+            spawnedBy = arguments[index + 1]
+            break
+        }
+        let prefix = "--spawned-by="
+        if argument.hasPrefix(prefix) {
+            spawnedBy = String(argument.dropFirst(prefix.count))
+            break
+        }
+    }
+
+    var ownerPID: Int32?
+    if isDaemon, let spawnedBy, let data = spawnedBy.data(using: .utf8),
+       let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+       payload["label"] as? String == "claude",
+       let number = payload["pid"] as? NSNumber {
+        let value = number.int64Value
+        if value > 0 && value <= Int64(Int32.max) {
+            ownerPID = Int32(value)
+        }
+    }
+    return AgentProcessMetadata(ownerPID: ownerPID, isInfrastructure: true)
+}
+
+/// Recover an agent executable identity from argv[0] when proc_pidpath no
+/// longer resolves it, such as a CLI left running across an npm upgrade.
+/// Reuse the normal classifier so app UI and unrelated processes stay out.
+func fallbackAgentExecutablePath(fromArguments arguments: [String]) -> String? {
+    guard let path = arguments.first,
+          agentFamily(forExecutablePath: path) != nil else { return nil }
+    return path
+}
+
 /// Collect one full pass over the process table into pure ProcessSamples.
-/// argv is fetched only for interpreter binaries (script identification);
-/// everything else is four cheap syscalls per pid.
+/// argv is fetched only for interpreter binaries (script identification) and
+/// agent roots (resume IDs); everything else is four cheap syscalls per pid.
 public func collectProcessSamples() -> [ProcessSample] {
     var samples: [ProcessSample] = []
     for pid in Proc.allPids() {
-        guard let info = Proc.basicInfo(pid),
-              let execPath = Proc.executablePath(pid) else { continue }
+        guard let info = Proc.basicInfo(pid) else { continue }
+        let resolvedPath = Proc.executablePath(pid)
+        let fallbackArguments = resolvedPath == nil ? Proc.arguments(pid) : nil
+        guard let execPath = resolvedPath
+            ?? fallbackArguments.flatMap(fallbackAgentExecutablePath) else { continue }
 
         let basename = (execPath.lowercased() as NSString).lastPathComponent
+        let family = agentFamily(forExecutablePath: execPath)
+        let arguments = isInterpreter(basename) || family != nil
+            ? (fallbackArguments ?? Proc.arguments(pid))
+            : nil
         var script: String?
-        if isInterpreter(basename), let arguments = Proc.arguments(pid) {
+        if isInterpreter(basename), let arguments {
             script = scriptPath(fromArguments: arguments)
         }
+        let sessionIDHint = family.flatMap { family in
+            arguments.flatMap { agentSessionIDHint(family: family, arguments: $0) }
+        }
+        let agentMetadata = family.flatMap { family in
+            arguments.map { agentProcessMetadata(family: family, arguments: $0) }
+        } ?? .none
 
         samples.append(ProcessSample(
             pid: pid,
             ppid: info.ppid,
             execPath: execPath,
             scriptPath: script,
+            sessionIDHint: sessionIDHint,
+            agentOwnerPID: agentMetadata.ownerPID,
+            isAgentInfrastructure: agentMetadata.isInfrastructure,
             cwd: Proc.workingDirectory(pid),
             footprint: Proc.physicalFootprint(pid) ?? 0,
             startTime: info.startTime

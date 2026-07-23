@@ -17,5 +17,6 @@ let package = Package(
         .executableTarget(name: "RambarFace", dependencies: ["RambarKit", "RambarSystem"]),
         .testTarget(name: "RambarKitTests", dependencies: ["RambarKit"]),
         .testTarget(name: "RambarSystemTests", dependencies: ["RambarSystem", "RambarKit"]),
+        .testTarget(name: "RambarFaceTests", dependencies: ["RambarFace"]),
     ]
 )
