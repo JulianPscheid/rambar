@@ -25,6 +25,7 @@ final class FaceModel: ObservableObject {
     private var timer: Timer?
     private var lastNotifiedEventTs: Double
     private let notificationsAvailable: Bool
+    private let reclaimFreshnessWindow: Double = 20
 
     init() {
         lastNotifiedEventTs = UserDefaults.standard.double(forKey: "lastNotifiedEventTs")
@@ -108,10 +109,24 @@ final class FaceModel: ObservableObject {
 
     // MARK: - Orphan reclaim
 
+    var canReclaimOrphans: Bool {
+        guard collectorRunning, let orphans, orphans.count > 0 else { return false }
+        return orphans.isFresh(
+            now: Date().timeIntervalSince1970,
+            maxAge: reclaimFreshnessWindow
+        )
+    }
+
     func reclaimOrphans() {
-        guard let orphans else { return }
-        for pid in orphans.pids {
-            kill(pid, SIGTERM)
+        guard canReclaimOrphans, let orphans else { return }
+        let samples = collectProcessSamples()
+        let reclaimable = reclaimableOrphanIdentities(
+            recorded: Set(orphans.identities),
+            samples: samples,
+            trees: buildSessionTrees(samples)
+        )
+        for identity in reclaimable {
+            kill(identity.pid, SIGTERM)
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
             self?.refresh()

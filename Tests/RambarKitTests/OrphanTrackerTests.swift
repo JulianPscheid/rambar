@@ -91,4 +91,41 @@ final class OrphanTrackerTests: XCTestCase {
         let report = scan(full, &tracker)
         XCTAssertEqual(report.count, 0)
     }
+
+    func testReclaimValidationRequiresSameDetachedProcessIdentity() {
+        let recorded = Set([ProcessIdentity(pid: 203, start: 1_000)])
+        let full = Fixture.machine
+
+        // The original helper is still alive and detached.
+        var detached = full.filter { $0.pid != 202 && $0.pid != 203 }
+        detached.append(Fixture.process(203, 1, Fixture.node, mb: 120))
+        XCTAssertEqual(
+            reclaimableOrphanIdentities(
+                recorded: recorded,
+                samples: detached,
+                trees: buildSessionTrees(detached)
+            ),
+            recorded
+        )
+
+        // The pid now belongs to another process.
+        var reused = full.filter { $0.pid != 202 && $0.pid != 203 }
+        reused.append(Fixture.process(203, 1, Fixture.python, mb: 500, start: 2_000))
+        XCTAssertTrue(
+            reclaimableOrphanIdentities(
+                recorded: recorded,
+                samples: reused,
+                trees: buildSessionTrees(reused)
+            ).isEmpty
+        )
+
+        // The original helper was adopted back into a live session tree.
+        XCTAssertTrue(
+            reclaimableOrphanIdentities(
+                recorded: recorded,
+                samples: full,
+                trees: buildSessionTrees(full)
+            ).isEmpty
+        )
+    }
 }

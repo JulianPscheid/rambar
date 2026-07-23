@@ -262,6 +262,7 @@ struct PanelView: View {
                         .buttonStyle(.plain)
                         .font(.caption.weight(.semibold))
                         .foregroundStyle(.orange)
+                        .disabled(!model.canReclaimOrphans)
                         .confirmationDialog(
                             "Send SIGTERM to \(orphans.count) orphaned helper processes?",
                             isPresented: $confirmingReclaim
