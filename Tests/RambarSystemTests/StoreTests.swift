@@ -211,6 +211,64 @@ final class StoreTests: XCTestCase {
         XCTAssertTrue(store.events(since: 2_001).isEmpty, "since is exclusive")
     }
 
+    func testOrphanStateRoundTripPreservesStableIdentities() throws {
+        let identities: Set<ProcessIdentity> = [
+            ProcessIdentity(pid: 203, start: 1_000.25),
+            ProcessIdentity(pid: 301, start: 2_000.5),
+        ]
+        let report = OrphanReport(
+            identities: identities,
+            footprint: 220 * 1_048_576,
+            newlyDetected: 2
+        )
+
+        try store.recordOrphanState(ts: 3_000, report: report, duplicates: [])
+
+        let state = try XCTUnwrap(store.latestOrphanState())
+        XCTAssertEqual(Set(state.identities), identities)
+        XCTAssertEqual(state.count, 2)
+        XCTAssertEqual(state.footprint, 220 * 1_048_576)
+        XCTAssertTrue(state.isFresh(now: 3_020, maxAge: 20))
+        XCTAssertFalse(state.isFresh(now: 3_021, maxAge: 20))
+        XCTAssertFalse(state.isFresh(now: 2_999, maxAge: 20))
+    }
+
+    func testLegacyPidOnlyOrphanStateCannotBeReclaimed() throws {
+        store = nil
+        try FileManager.default.removeItem(
+            atPath: (path as NSString).deletingLastPathComponent
+        )
+        try FileManager.default.createDirectory(
+            atPath: (path as NSString).deletingLastPathComponent,
+            withIntermediateDirectories: true
+        )
+
+        var database: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(path, &database), SQLITE_OK)
+        defer { sqlite3_close(database) }
+        let legacySchema = """
+            CREATE TABLE orphan_state(
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                ts REAL NOT NULL,
+                count INTEGER NOT NULL,
+                footprint INTEGER NOT NULL,
+                pids TEXT NOT NULL,
+                dups TEXT NOT NULL DEFAULT '[]'
+            );
+            INSERT INTO orphan_state(id, ts, count, footprint, pids, dups)
+            VALUES(1, 3000, 1, 104857600, '203', '[]');
+            """
+        XCTAssertEqual(sqlite3_exec(database, legacySchema, nil, nil, nil), SQLITE_OK)
+        sqlite3_close(database)
+        database = nil
+
+        store = try Store(path: path)
+        let state = try XCTUnwrap(store.latestOrphanState())
+        XCTAssertTrue(state.identities.isEmpty)
+        XCTAssertEqual(state.count, 0)
+        XCTAssertEqual(state.footprint, 0)
+    }
+
     func testCompactionDownsamplesOldRawSamples() throws {
         let now = 1_000_000.0
         let alpha = tree(pid: 50, project: "alpha", mb: 100)

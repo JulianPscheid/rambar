@@ -187,9 +187,14 @@ public final class Store {
                 count INTEGER NOT NULL,
                 footprint INTEGER NOT NULL,
                 pids TEXT NOT NULL,
+                identities TEXT NOT NULL DEFAULT '[]',
                 dups TEXT NOT NULL DEFAULT '[]'
             )
             """)
+        // v2.0.0 stored bare pids, which are unsafe to act on after pid reuse.
+        // Keep that column for migration compatibility, but reclaim only from
+        // stable (pid, start time) identities in the new JSON column.
+        try? execute("ALTER TABLE orphan_state ADD COLUMN identities TEXT NOT NULL DEFAULT '[]'")
     }
 
     // MARK: - Low-level helpers
@@ -411,6 +416,11 @@ public final class Store {
         ts: Double, report: OrphanReport, duplicates: [DuplicateGroup]
     ) throws {
         let pids = report.identities.map { String($0.pid) }.sorted().joined(separator: ",")
+        let sortedIdentities = report.identities.sorted {
+            $0.pid == $1.pid ? $0.start < $1.start : $0.pid < $1.pid
+        }
+        let identitiesJSON = (try? JSONEncoder().encode(sortedIdentities))
+            .map { String(decoding: $0, as: UTF8.self) } ?? "[]"
         let dups = duplicates.map {
             DuplicateJSON(
                 commandPath: $0.commandPath,
@@ -422,36 +432,50 @@ public final class Store {
         let dupsJSON = (try? JSONEncoder().encode(dups))
             .map { String(decoding: $0, as: UTF8.self) } ?? "[]"
         try execute("""
-            INSERT OR REPLACE INTO orphan_state(id, ts, count, footprint, pids, dups)
-            VALUES(1,?,?,?,?,?)
+            INSERT OR REPLACE INTO orphan_state(id, ts, count, footprint, pids, identities, dups)
+            VALUES(1,?,?,?,?,?,?)
             """, [
                 .real(ts),
                 .int(Int64(report.count)),
                 .int(Int64(bitPattern: report.footprint)),
                 .text(pids),
+                .text(identitiesJSON),
                 .text(dupsJSON),
             ])
     }
 
     public struct OrphanState: Sendable {
         public let ts: Double
-        public let count: Int
         public let footprint: UInt64
-        public let pids: [Int32]
+        public let identities: [ProcessIdentity]
         public let duplicates: [DuplicateJSON]
+
+        public var count: Int { identities.count }
+        @available(*, deprecated, message: "Use identities before signaling a process")
+        public var pids: [Int32] { identities.map(\.pid) }
+
+        public func isFresh(now: Double, maxAge: Double) -> Bool {
+            let age = now - ts
+            return age >= 0 && age <= maxAge
+        }
     }
 
     public func latestOrphanState() -> OrphanState? {
-        query("SELECT ts, count, footprint, pids, dups FROM orphan_state WHERE id = 1") { statement in
-            let dupsText = Self.text(statement, 4)
+        query("SELECT ts, footprint, identities, dups FROM orphan_state WHERE id = 1") { statement in
+            let identitiesText = Self.text(statement, 2)
+            let identities = (try? JSONDecoder().decode(
+                [ProcessIdentity].self, from: Data(identitiesText.utf8)
+            )) ?? []
+            let dupsText = Self.text(statement, 3)
             let dups = (try? JSONDecoder().decode(
                 [DuplicateJSON].self, from: Data(dupsText.utf8)
             )) ?? []
             return OrphanState(
                 ts: sqlite3_column_double(statement, 0),
-                count: Int(sqlite3_column_int64(statement, 1)),
-                footprint: UInt64(bitPattern: sqlite3_column_int64(statement, 2)),
-                pids: Self.text(statement, 3).split(separator: ",").compactMap { Int32($0) },
+                footprint: identities.isEmpty
+                    ? 0
+                    : UInt64(bitPattern: sqlite3_column_int64(statement, 1)),
+                identities: identities,
                 duplicates: dups
             )
         }.first

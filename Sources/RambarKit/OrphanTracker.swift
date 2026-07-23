@@ -87,3 +87,16 @@ public struct OrphanTracker: Sendable {
         return OrphanReport(identities: orphans, footprint: footprint, newlyDetected: newlyDetected)
     }
 }
+
+/// Revalidate persisted orphan identities against a fresh process scan before
+/// acting on them. A matching pid is not enough: it must still have the same
+/// start time and remain outside every active agent session tree.
+public func reclaimableOrphanIdentities(
+    recorded: Set<ProcessIdentity>,
+    samples: [ProcessSample],
+    trees: [AgentSessionTree]
+) -> Set<ProcessIdentity> {
+    let alive = Set(samples.lazy.filter { $0.pid > 0 }.map(\.identity))
+    let claimed = Set(trees.lazy.flatMap(\.members).map(\.identity))
+    return recorded.intersection(alive).subtracting(claimed)
+}

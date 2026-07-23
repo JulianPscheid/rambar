@@ -63,12 +63,37 @@ struct RambarFaceApp: App {
         } label: {
             // Template rendering keeps menu bar icons monochrome; state is
             // encoded in the symbol itself, not a color that would be lost.
-            Image(systemName: model.pressure == .normal ? "memorychip" : "memorychip.fill")
-            Text(model.usedPercentText)
-                .monospacedDigit()
+            let symbolName = model.pressure == .normal ? "memorychip" : "memorychip.fill"
+            Label {
+                Text(model.usedPercentText)
+                    .monospacedDigit()
+            } icon: {
+                Image(nsImage: menuBarSymbol(named: symbolName))
+            }
+            .labelStyle(.titleAndIcon)
         }
         .menuBarExtraStyle(.window)
     }
+}
+
+private func menuBarSymbol(named name: String) -> NSImage {
+    guard let symbol = NSImage(systemSymbolName: name, accessibilityDescription: nil) else {
+        return NSImage()
+    }
+
+    // The memorychip glyph sits below the text's visible center. Move only
+    // its drawing so MenuBarExtra cannot recenter away the correction.
+    let image = NSImage(size: symbol.size, flipped: false) { rect in
+        symbol.draw(
+            in: rect.offsetBy(dx: 0, dy: 1.25),
+            from: .zero,
+            operation: .sourceOver,
+            fraction: 1
+        )
+        return true
+    }
+    image.isTemplate = true
+    return image
 }
 
 @MainActor

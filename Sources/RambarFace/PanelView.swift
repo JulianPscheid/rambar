@@ -20,57 +20,7 @@ struct PanelView: View {
 
             Divider()
 
-            if model.collectorNeedsUpdate {
-                VStack(spacing: 5) {
-                    Text("collector update required")
-                        .font(.callout.weight(.medium))
-                    Text("Run the bundled rambar-cli install-daemon command")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 24)
-            } else if !model.hasProcessGroupSnapshot {
-                Text("waiting for process sample")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 28)
-            } else if model.processGroups.isEmpty {
-                Text("no significant process groups")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 28)
-            } else if snapshotMode {
-                VStack(alignment: .leading, spacing: 2) {
-                    ForEach(snapshotGroups, id: \.key) { group in
-                        processGroupRow(group)
-                    }
-                    if model.processGroups.count > snapshotRowLimit {
-                        Text("… and \(model.processGroups.count - snapshotRowLimit) more groups")
-                            .font(.caption2)
-                            .foregroundStyle(.tertiary)
-                            .padding(.horizontal, 6)
-                            .padding(.top, 4)
-                    }
-                }
-                .padding(.horizontal, 8)
-                .padding(.vertical, 8)
-            } else {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 2) {
-                        ForEach(model.processGroups, id: \.key) { group in
-                            processGroupRow(group)
-                        }
-                    }
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 8)
-                }
-                // ScrollView has no intrinsic height and collapses inside a
-                // MenuBarExtra window — size it to the content, capped.
-                .frame(height: sessionListHeight)
-            }
+            listContent
 
             if hasHygiene {
                 Divider()
@@ -85,6 +35,98 @@ struct PanelView: View {
                 .padding(.vertical, 9)
         }
         .frame(width: 344)
+    }
+
+    private var showsProcessGroups: Bool {
+        model.groupByApp && !snapshotMode
+    }
+
+    @ViewBuilder
+    private var listContent: some View {
+        if showsProcessGroups {
+            processGroupList
+        } else {
+            sessionList
+        }
+    }
+
+    @ViewBuilder
+    private var sessionList: some View {
+        if model.sessions.isEmpty {
+            Text("no active agent sessions")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 28)
+        } else if snapshotMode {
+            VStack(alignment: .leading, spacing: 2) {
+                ForEach(snapshotSessionGroups, id: \.family) { group in
+                    familySection(group.family, group.sessions)
+                }
+                if model.sessions.count > snapshotRowLimit {
+                    Text("… and \(model.sessions.count - snapshotRowLimit) more sessions")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .padding(.horizontal, 6)
+                        .padding(.top, 4)
+                }
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 8)
+        } else {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 2) {
+                    ForEach(model.familyGroups, id: \.family) { group in
+                        familySection(group.family, group.sessions)
+                    }
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 8)
+            }
+            // ScrollView has no intrinsic height and collapses inside a
+            // MenuBarExtra window — size it to the content, capped.
+            .frame(height: sessionListHeight)
+        }
+    }
+
+    @ViewBuilder
+    private var processGroupList: some View {
+        if model.collectorNeedsUpdate {
+            VStack(spacing: 5) {
+                Text("collector update required")
+                    .font(.callout.weight(.medium))
+                Text("Run the bundled rambar-cli install-daemon command")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 24)
+        } else if !model.hasProcessGroupSnapshot {
+            Text("waiting for process sample")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 28)
+        } else if model.processGroups.isEmpty {
+            Text("no significant process groups")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 28)
+        } else {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 2) {
+                    ForEach(model.processGroups, id: \.key) { group in
+                        processGroupRow(group)
+                    }
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 8)
+            }
+            // ScrollView has no intrinsic height and collapses inside a
+            // MenuBarExtra window — size it to the content, capped.
+            .frame(height: processGroupListHeight)
+        }
     }
 
     // MARK: - Header
@@ -116,13 +158,22 @@ struct PanelView: View {
             .frame(height: 26)
 
             if let system = model.system {
-                Text("compressed \(formatBytes(system.compressed))"
-                    + " · \(model.processGroups.count) process groups")
+                Text(headerSummary(for: system))
                     .font(.caption)
                     .monospacedDigit()
                     .foregroundStyle(.secondary)
             }
         }
+    }
+
+    private func headerSummary(for system: SystemRecord) -> String {
+        if showsProcessGroups {
+            return "compressed \(formatBytes(system.compressed))"
+                + " · \(model.processGroups.count) process groups"
+        }
+        return "compressed \(formatBytes(system.compressed))"
+            + " · agents \(formatBytes(model.attributedTotal))"
+            + " across \(model.sessions.count) sessions"
     }
 
     private var pressureBadge: some View {
@@ -141,7 +192,29 @@ struct PanelView: View {
         .help("Kernel memory-pressure level — the signal that matters, not the raw percent")
     }
 
-    // MARK: - Process groups and sessions
+    // MARK: - Sessions and process groups
+
+    private func familySection(_ family: AgentFamily, _ sessions: [SessionRecord]) -> some View {
+        let total = sessions.reduce(UInt64(0)) { $0 + $1.footprint }
+        return VStack(alignment: .leading, spacing: 1) {
+            HStack {
+                Text(family.displayName.uppercased())
+                    .kerning(0.8)
+                Spacer()
+                Text("\(sessions.count) · \(formatBytes(total))")
+                    .monospacedDigit()
+            }
+            .font(.caption2.weight(.semibold))
+            .foregroundStyle(.tertiary)
+            .padding(.horizontal, 6)
+            .padding(.top, 8)
+            .padding(.bottom, 3)
+
+            ForEach(sessions, id: \.key) { session in
+                sessionRow(session)
+            }
+        }
+    }
 
     private func processGroupRow(_ group: ProcessGroup) -> some View {
         let expanded = model.expandedGroupKey == group.key
@@ -367,6 +440,7 @@ struct PanelView: View {
                         .buttonStyle(.plain)
                         .font(.caption.weight(.semibold))
                         .foregroundStyle(.orange)
+                        .disabled(!model.canReclaimOrphans)
                         .confirmationDialog(
                             "Send SIGTERM to \(orphans.count) orphaned helper processes?",
                             isPresented: $confirmingReclaim
@@ -406,7 +480,7 @@ struct PanelView: View {
 
     private var footer: some View {
         HStack {
-            if model.collectorNeedsUpdate {
+            if showsProcessGroups && model.collectorNeedsUpdate {
                 Label("collector update required", systemImage: "exclamationmark.triangle")
                     .font(.caption2)
                     .foregroundStyle(.orange)
@@ -425,6 +499,15 @@ struct PanelView: View {
                 Menu {
                     Button("Refresh now") { model.refresh() }
                     Divider()
+                    Toggle("Notifications", isOn: Binding(
+                        get: { model.notificationsEnabled },
+                        set: { model.setNotificationsEnabled($0) }
+                    ))
+                    Toggle("Group by app", isOn: Binding(
+                        get: { model.groupByApp },
+                        set: { model.setGroupByApp($0) }
+                    ))
+                    Divider()
                     Button("Quit Rambar") { NSApp.terminate(nil) }
                 } label: {
                     Image(systemName: "ellipsis.circle")
@@ -438,6 +521,15 @@ struct PanelView: View {
     }
 
     private var sessionListHeight: CGFloat {
+        let rows = CGFloat(model.sessions.count) * 38
+        let headers = CGFloat(model.familyGroups.count) * 27
+        let expansion = model.expandedKey == nil
+            ? 0
+            : CGFloat(max(model.expandedChildren.count, 1)) * 20 + 10
+        return min(rows + headers + expansion + 16, 380)
+    }
+
+    private var processGroupListHeight: CGFloat {
         let rows = CGFloat(model.processGroups.count) * 38
         let expandedSessions = model.processGroups.first { $0.key == model.expandedGroupKey }
             .map { model.sessions(for: $0).count } ?? 0
@@ -453,8 +545,15 @@ struct PanelView: View {
 
     private let snapshotRowLimit = 12
 
-    private var snapshotGroups: [ProcessGroup] {
-        Array(model.processGroups.prefix(snapshotRowLimit))
+    private var snapshotSessionGroups: [(family: AgentFamily, sessions: [SessionRecord])] {
+        var remaining = snapshotRowLimit
+        var groups: [(AgentFamily, [SessionRecord])] = []
+        for group in model.familyGroups where remaining > 0 {
+            let take = Array(group.sessions.prefix(remaining))
+            remaining -= take.count
+            groups.append((group.family, take))
+        }
+        return groups
     }
 
     private func gbNumber(_ bytes: UInt64) -> String {
