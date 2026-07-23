@@ -10,6 +10,7 @@ struct PanelView: View {
     /// ImageRenderer cannot draw ScrollView content or Menu controls; the
     /// --snapshot path renders a flat, bounded list instead.
     var snapshotMode = false
+    @State private var pendingEndKey: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -35,6 +36,21 @@ struct PanelView: View {
                 .padding(.vertical, 9)
         }
         .frame(width: 344)
+        .confirmationDialog(
+            "End \(pendingEndSession?.displayName ?? "session")?",
+            isPresented: endConfirmationPresented,
+            titleVisibility: .visible
+        ) {
+            Button("End session", role: .destructive) {
+                if let session = pendingEndSession {
+                    model.intervene(session, action: .terminate)
+                }
+                pendingEndKey = nil
+            }
+            Button("Cancel", role: .cancel) { pendingEndKey = nil }
+        } message: {
+            Text("Rambar will send SIGTERM to the verified process tree. Unsaved work in that session may be lost.")
+        }
     }
 
     private var showsProcessGroups: Bool {
@@ -343,6 +359,18 @@ struct PanelView: View {
                             .foregroundStyle(.secondary)
                             .help("Grew ≥ 1 MB/min over the last 10 minutes")
                     }
+                    if let state = model.sessionInterventionStates[session.key],
+                       state.status != .running {
+                        Image(systemName: state.status == .stopped
+                            ? "pause.fill"
+                            : "pause.circle")
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundStyle(.orange)
+                            .help(state.status == .stopped
+                                ? "This session is paused"
+                                : "\(state.stoppedProcessCount) of "
+                                    + "\(state.processCount) processes stopped")
+                    }
                     VStack(alignment: .trailing, spacing: 1) {
                         Text(formatBytes(session.footprint))
                             .font(.system(size: 13, weight: .semibold))
@@ -363,7 +391,8 @@ struct PanelView: View {
                         in: RoundedRectangle(cornerRadius: 6))
 
             if expanded {
-                VStack(alignment: .leading, spacing: 3) {
+                VStack(alignment: .leading, spacing: 6) {
+                    sessionControls(session)
                     if let id = session.sessionID {
                         HStack(alignment: .firstTextBaseline, spacing: 6) {
                             Text("session ID")
@@ -373,21 +402,23 @@ struct PanelView: View {
                                 .textSelection(.enabled)
                         }
                         .font(.caption2)
-                        .padding(.bottom, 2)
                     }
-                    ForEach(model.expandedChildren, id: \.pid) { child in
+                    Text("largest processes")
+                        .font(.caption2.weight(.medium))
+                        .foregroundStyle(.tertiary)
+                    ForEach(model.expandedProcesses, id: \.pid) { process in
                         HStack {
-                            Text(child.commandLabel)
+                            Text(process.commandLabel)
                                 .lineLimit(1)
                             Spacer()
-                            Text(formatBytes(child.footprint))
+                            Text(formatBytes(process.footprint))
                                 .monospacedDigit()
                         }
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     }
-                    if model.expandedChildren.isEmpty {
-                        Text("no helper processes")
+                    if model.expandedProcesses.isEmpty {
+                        Text("no live process details")
                             .font(.caption)
                             .foregroundStyle(.tertiary)
                     }
@@ -396,6 +427,141 @@ struct PanelView: View {
                 .padding(.trailing, 6)
                 .padding(.vertical, 4)
             }
+        }
+    }
+
+    private func sessionControls(_ session: SessionRecord) -> some View {
+        let busy = model.interveningKeys.contains(session.key)
+        let state = model.sessionInterventionStates[session.key]
+            ?? SessionTreeInterventionState(
+                stoppedProcessCount: 0,
+                runningProcessCount: max(session.processCount, 0)
+            )
+        let title: String
+        let symbol: String
+        switch state.status {
+        case .running:
+            title = "Session controls"
+            symbol = "switch.2"
+        case .partiallyStopped:
+            title = "Session partially paused"
+            symbol = "pause.circle"
+        case .stopped:
+            title = "Session paused"
+            symbol = "pause.circle.fill"
+        }
+
+        let interruptButton = Button {
+            model.intervene(session, action: .interrupt)
+        } label: {
+            Label("Interrupt", systemImage: "stop.circle")
+                .frame(maxWidth: .infinity)
+        }
+        .buttonStyle(.bordered)
+        .help("Send SIGINT to the agent root, like pressing Control-C")
+
+        let pauseButton = Button {
+            model.intervene(session, action: .pause)
+        } label: {
+            Label("Pause", systemImage: "pause.fill")
+                .frame(maxWidth: .infinity)
+        }
+        .buttonStyle(.bordered)
+        .tint(.orange)
+        .help(state.status == .partiallyStopped
+            ? "Retry pausing this session's verified process tree"
+            : "Pause this session's verified process tree")
+
+        let resumeButton = Button {
+            model.intervene(session, action: .resume)
+        } label: {
+            Label("Resume", systemImage: "play.fill")
+                .frame(maxWidth: .infinity)
+        }
+        .buttonStyle(.bordered)
+        .tint(.green)
+        .help("Resume this session's verified process tree")
+
+        let primaryResumeButton = Button {
+            model.intervene(session, action: .resume)
+        } label: {
+            Label("Resume", systemImage: "play.fill")
+                .frame(maxWidth: .infinity)
+        }
+        .buttonStyle(.borderedProminent)
+        .tint(.green)
+        .help("Resume this session's verified process tree")
+
+        let endButton = Button {
+            pendingEndKey = session.key
+        } label: {
+            Label("End", systemImage: "power")
+                .frame(maxWidth: .infinity)
+        }
+        .buttonStyle(.bordered)
+        .tint(.red)
+        .help("Ask this session's verified process tree to terminate")
+
+        return VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Label(title, systemImage: symbol)
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(
+                    state.status == .running ? Color.secondary : Color.orange
+                )
+                Spacer()
+                if busy {
+                    ProgressView()
+                        .controlSize(.small)
+                }
+            }
+
+            if state.status == .partiallyStopped {
+                Text("\(state.stoppedProcessCount) of \(state.processCount) processes stopped")
+                    .font(.caption2)
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+            }
+
+            Group {
+                if state.status == .partiallyStopped {
+                    VStack(spacing: 6) {
+                        HStack(spacing: 6) {
+                            pauseButton
+                            resumeButton
+                        }
+                        HStack(spacing: 6) {
+                            interruptButton
+                            endButton
+                        }
+                    }
+                } else {
+                    HStack(spacing: 6) {
+                        interruptButton
+                        if state.status == .stopped {
+                            primaryResumeButton
+                        } else {
+                            pauseButton
+                        }
+                        endButton
+                    }
+                }
+            }
+            .font(.caption.weight(.medium))
+            .controlSize(.small)
+            .disabled(busy)
+
+            if let message = model.interventionMessages[session.key] {
+                Text(message)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(8)
+        .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 7))
+        .overlay {
+            RoundedRectangle(cornerRadius: 7)
+                .stroke(.quaternary, lineWidth: 1)
         }
     }
 
@@ -478,12 +644,39 @@ struct PanelView: View {
 
     // MARK: - Footer
 
+    private var pausedSessionFooterText: String? {
+        let states = model.sessionInterventionStates.values
+        let stopped = states.filter { $0.status == .stopped }.count
+        let partial = states.filter { $0.status == .partiallyStopped }.count
+        if partial == 0 {
+            if stopped == 0 { return nil }
+            return stopped == 1 ? "1 session paused" : "\(stopped) sessions paused"
+        }
+        if stopped == 0 {
+            return partial == 1
+                ? "1 session partially paused"
+                : "\(partial) sessions partially paused"
+        }
+        return "\(stopped + partial) sessions paused or partially paused"
+    }
+
     private var footer: some View {
         HStack {
-            if showsProcessGroups && model.collectorNeedsUpdate {
+            if let settingsError = model.settingsError {
+                Label(settingsError, systemImage: "exclamationmark.triangle")
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+            } else if showsProcessGroups && model.collectorNeedsUpdate {
                 Label("collector update required", systemImage: "exclamationmark.triangle")
                     .font(.caption2)
                     .foregroundStyle(.orange)
+            } else if let pausedSessionFooterText {
+                Label(
+                    pausedSessionFooterText,
+                    systemImage: "pause.circle.fill"
+                )
+                .font(.caption2)
+                .foregroundStyle(.orange)
             } else if model.collectorRunning {
                 Text("sampled \(Int(max(model.sampledAgo, 0)))s ago")
                     .font(.caption2)
@@ -507,6 +700,14 @@ struct PanelView: View {
                         get: { model.groupByApp },
                         set: { model.setGroupByApp($0) }
                     ))
+                    Toggle(
+                        "Auto-pause runaway sessions",
+                        isOn: Binding(
+                            get: { model.autoPauseEnabled },
+                            set: { model.setAutoPauseEnabled($0) }
+                        )
+                    )
+                    .help("Opt in to pausing a verified agent tree after two runaway samples. Rambar never ends it automatically.")
                     Divider()
                     Button("Quit Rambar") { NSApp.terminate(nil) }
                 } label: {
@@ -525,7 +726,7 @@ struct PanelView: View {
         let headers = CGFloat(model.familyGroups.count) * 27
         let expansion = model.expandedKey == nil
             ? 0
-            : CGFloat(max(model.expandedChildren.count, 1)) * 20 + 10
+            : CGFloat(max(model.expandedProcesses.count, 1)) * 20 + 10
         return min(rows + headers + expansion + 16, 380)
     }
 
@@ -537,10 +738,22 @@ struct PanelView: View {
         let expandedHostCount = model.processGroups.first { $0.key == model.expandedGroupKey }?
             .hostProcessCount ?? 0
         let hostRows: CGFloat = expandedHostCount > 0 ? 38 : 0
-        let childRows = model.expandedKey == nil
+        let processRows = model.expandedKey == nil
             ? 0
-            : CGFloat(max(model.expandedChildren.count, 1)) * 20 + 10
-        return min(rows + sessionRows + hostRows + childRows + 16, 380)
+            : CGFloat(max(model.expandedProcesses.count, 1)) * 20 + 42
+        return min(rows + sessionRows + hostRows + processRows + 16, 420)
+    }
+
+    private var pendingEndSession: SessionRecord? {
+        guard let pendingEndKey else { return nil }
+        return model.sessions.first { $0.key == pendingEndKey }
+    }
+
+    private var endConfirmationPresented: Binding<Bool> {
+        Binding(
+            get: { pendingEndKey != nil },
+            set: { if !$0 { pendingEndKey = nil } }
+        )
     }
 
     private let snapshotRowLimit = 12
