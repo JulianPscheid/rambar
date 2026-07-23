@@ -15,21 +15,25 @@ final class SessionInterventionTests: XCTestCase {
         return predicate()
     }
 
-    private func sessionSamples() -> [ProcessSample] {
+    private func sessionSamples(
+        stoppedPIDs: Set<Int32> = []
+    ) -> [ProcessSample] {
         [
             ProcessSample(
                 pid: 100,
                 ppid: 1,
                 execPath: "/Users/dev/.local/share/claude/versions/2.1.217",
                 footprint: 10,
-                startTime: 1_000
+                startTime: 1_000,
+                isStopped: stoppedPIDs.contains(100)
             ),
             ProcessSample(
                 pid: 101,
                 ppid: 100,
                 execPath: "/opt/homebrew/bin/node",
                 footprint: 20,
-                startTime: 1_001
+                startTime: 1_001,
+                isStopped: stoppedPIDs.contains(101)
             ),
             ProcessSample(
                 pid: 200,
@@ -39,6 +43,48 @@ final class SessionInterventionTests: XCTestCase {
                 startTime: 2_000
             ),
         ]
+    }
+
+    private func interventionState(
+        stoppedPIDs: Set<Int32>
+    ) throws -> SessionTreeInterventionState {
+        let tree = try XCTUnwrap(
+            buildSessionTrees(sessionSamples(stoppedPIDs: stoppedPIDs))
+                .first { $0.root.pid == 100 }
+        )
+        return sessionTreeInterventionState(tree)
+    }
+
+    func testRootStoppedWhileChildRunningYieldsPartial() throws {
+        let state = try interventionState(stoppedPIDs: [100])
+
+        XCTAssertEqual(state.status, .partiallyStopped)
+        XCTAssertEqual(state.stoppedProcessCount, 1)
+        XCTAssertEqual(state.runningProcessCount, 1)
+    }
+
+    func testResumeLeavingStoppedChildYieldsPartial() throws {
+        let state = try interventionState(stoppedPIDs: [101])
+
+        XCTAssertEqual(state.status, .partiallyStopped)
+        XCTAssertEqual(state.stoppedProcessCount, 1)
+        XCTAssertEqual(state.runningProcessCount, 1)
+    }
+
+    func testFullStopYieldsStopped() throws {
+        let state = try interventionState(stoppedPIDs: [100, 101])
+
+        XCTAssertEqual(state.status, .stopped)
+        XCTAssertEqual(state.stoppedProcessCount, 2)
+        XCTAssertEqual(state.runningProcessCount, 0)
+    }
+
+    func testFullyRunningTreeYieldsRunning() throws {
+        let state = try interventionState(stoppedPIDs: [])
+
+        XCTAssertEqual(state.status, .running)
+        XCTAssertEqual(state.stoppedProcessCount, 0)
+        XCTAssertEqual(state.runningProcessCount, 2)
     }
 
     func testPauseSignalsOnlyExactSessionMembers() {
@@ -57,6 +103,8 @@ final class SessionInterventionTests: XCTestCase {
         XCTAssertTrue(result.foundSession)
         XCTAssertEqual(result.targetedProcessCount, 2)
         XCTAssertEqual(result.signaledProcessCount, 2)
+        XCTAssertTrue(result.completedAllTargets)
+        XCTAssertEqual(result.missedProcessCount, 0)
         XCTAssertEqual(sent.map(\.0), [100, 101])
         XCTAssertEqual(sent.map(\.1), [SIGSTOP, SIGSTOP])
     }
@@ -115,7 +163,28 @@ final class SessionInterventionTests: XCTestCase {
 
         XCTAssertEqual(result.signaledProcessCount, 1)
         XCTAssertEqual(result.staleProcessCount, 1)
+        XCTAssertEqual(result.missedProcessCount, 0)
+        XCTAssertFalse(result.completedAllTargets)
         XCTAssertEqual(sent.map(\.0), [100])
+    }
+
+    func testFailedChildMakesInterventionIncomplete() {
+        let samples = sessionSamples()
+
+        let result = performSessionIntervention(
+            root: ProcessIdentity(pid: 100, start: 1_000),
+            action: .pause,
+            trees: buildSessionTrees(samples),
+            identityLookup: { pid in samples.first { $0.pid == pid }?.identity },
+            sendSignal: { pid, _ in pid == 101 ? -1 : 0 }
+        )
+
+        XCTAssertEqual(result.targetedProcessCount, 2)
+        XCTAssertEqual(result.signaledProcessCount, 1)
+        XCTAssertEqual(result.failedProcessCount, 1)
+        XCTAssertEqual(result.staleProcessCount, 0)
+        XCTAssertEqual(result.missedProcessCount, 0)
+        XCTAssertFalse(result.completedAllTargets)
     }
 
     func testStaleRootAbortsBeforeAnyChildSignal() {
@@ -136,6 +205,8 @@ final class SessionInterventionTests: XCTestCase {
 
         XCTAssertEqual(result.signaledProcessCount, 0)
         XCTAssertEqual(result.staleProcessCount, 1)
+        XCTAssertEqual(result.missedProcessCount, 1)
+        XCTAssertFalse(result.completedAllTargets)
         XCTAssertTrue(sent.isEmpty)
     }
 

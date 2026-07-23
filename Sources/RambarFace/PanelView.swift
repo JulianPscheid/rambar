@@ -359,11 +359,17 @@ struct PanelView: View {
                             .foregroundStyle(.secondary)
                             .help("Grew ≥ 1 MB/min over the last 10 minutes")
                     }
-                    if model.pausedSessionKeys.contains(session.key) {
-                        Image(systemName: "pause.fill")
+                    if let state = model.sessionInterventionStates[session.key],
+                       state.status != .running {
+                        Image(systemName: state.status == .stopped
+                            ? "pause.fill"
+                            : "pause.circle")
                             .font(.system(size: 9, weight: .semibold))
                             .foregroundStyle(.orange)
-                            .help("This session is paused")
+                            .help(state.status == .stopped
+                                ? "This session is paused"
+                                : "\(state.stoppedProcessCount) of "
+                                    + "\(state.processCount) processes stopped")
                     }
                     VStack(alignment: .trailing, spacing: 1) {
                         Text(formatBytes(session.footprint))
@@ -426,15 +432,83 @@ struct PanelView: View {
 
     private func sessionControls(_ session: SessionRecord) -> some View {
         let busy = model.interveningKeys.contains(session.key)
-        let paused = model.pausedSessionKeys.contains(session.key)
+        let state = model.sessionInterventionStates[session.key]
+            ?? SessionTreeInterventionState(
+                stoppedProcessCount: 0,
+                runningProcessCount: max(session.processCount, 0)
+            )
+        let title: String
+        let symbol: String
+        switch state.status {
+        case .running:
+            title = "Session controls"
+            symbol = "switch.2"
+        case .partiallyStopped:
+            title = "Session partially paused"
+            symbol = "pause.circle"
+        case .stopped:
+            title = "Session paused"
+            symbol = "pause.circle.fill"
+        }
+
+        let interruptButton = Button {
+            model.intervene(session, action: .interrupt)
+        } label: {
+            Label("Interrupt", systemImage: "stop.circle")
+                .frame(maxWidth: .infinity)
+        }
+        .buttonStyle(.bordered)
+        .help("Send SIGINT to the agent root, like pressing Control-C")
+
+        let pauseButton = Button {
+            model.intervene(session, action: .pause)
+        } label: {
+            Label("Pause", systemImage: "pause.fill")
+                .frame(maxWidth: .infinity)
+        }
+        .buttonStyle(.bordered)
+        .tint(.orange)
+        .help(state.status == .partiallyStopped
+            ? "Retry pausing this session's verified process tree"
+            : "Pause this session's verified process tree")
+
+        let resumeButton = Button {
+            model.intervene(session, action: .resume)
+        } label: {
+            Label("Resume", systemImage: "play.fill")
+                .frame(maxWidth: .infinity)
+        }
+        .buttonStyle(.bordered)
+        .tint(.green)
+        .help("Resume this session's verified process tree")
+
+        let primaryResumeButton = Button {
+            model.intervene(session, action: .resume)
+        } label: {
+            Label("Resume", systemImage: "play.fill")
+                .frame(maxWidth: .infinity)
+        }
+        .buttonStyle(.borderedProminent)
+        .tint(.green)
+        .help("Resume this session's verified process tree")
+
+        let endButton = Button {
+            pendingEndKey = session.key
+        } label: {
+            Label("End", systemImage: "power")
+                .frame(maxWidth: .infinity)
+        }
+        .buttonStyle(.bordered)
+        .tint(.red)
+        .help("Ask this session's verified process tree to terminate")
+
         return VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 6) {
-                Label(
-                    paused ? "Session paused" : "Session controls",
-                    systemImage: paused ? "pause.circle.fill" : "switch.2"
-                )
+                Label(title, systemImage: symbol)
                 .font(.caption2.weight(.semibold))
-                .foregroundStyle(paused ? .orange : .secondary)
+                .foregroundStyle(
+                    state.status == .running ? Color.secondary : Color.orange
+                )
                 Spacer()
                 if busy {
                     ProgressView()
@@ -442,47 +516,36 @@ struct PanelView: View {
                 }
             }
 
-            HStack(spacing: 6) {
-                Button {
-                    model.intervene(session, action: .interrupt)
-                } label: {
-                    Label("Interrupt", systemImage: "stop.circle")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.bordered)
-                .help("Send SIGINT to the agent root, like pressing Control-C")
+            if state.status == .partiallyStopped {
+                Text("\(state.stoppedProcessCount) of \(state.processCount) processes stopped")
+                    .font(.caption2)
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+            }
 
-                if paused {
-                    Button {
-                        model.intervene(session, action: .resume)
-                    } label: {
-                        Label("Resume", systemImage: "play.fill")
-                            .frame(maxWidth: .infinity)
+            Group {
+                if state.status == .partiallyStopped {
+                    VStack(spacing: 6) {
+                        HStack(spacing: 6) {
+                            pauseButton
+                            resumeButton
+                        }
+                        HStack(spacing: 6) {
+                            interruptButton
+                            endButton
+                        }
                     }
-                    .buttonStyle(.borderedProminent)
-                    .tint(.green)
-                    .help("Resume this session's verified process tree")
                 } else {
-                    Button {
-                        model.intervene(session, action: .pause)
-                    } label: {
-                        Label("Pause", systemImage: "pause.fill")
-                            .frame(maxWidth: .infinity)
+                    HStack(spacing: 6) {
+                        interruptButton
+                        if state.status == .stopped {
+                            primaryResumeButton
+                        } else {
+                            pauseButton
+                        }
+                        endButton
                     }
-                    .buttonStyle(.bordered)
-                    .tint(.orange)
-                    .help("Pause this session's verified process tree")
                 }
-
-                Button {
-                    pendingEndKey = session.key
-                } label: {
-                    Label("End", systemImage: "power")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.bordered)
-                .tint(.red)
-                .help("Ask this session's verified process tree to terminate")
             }
             .font(.caption.weight(.medium))
             .controlSize(.small)
@@ -581,6 +644,22 @@ struct PanelView: View {
 
     // MARK: - Footer
 
+    private var pausedSessionFooterText: String? {
+        let states = model.sessionInterventionStates.values
+        let stopped = states.filter { $0.status == .stopped }.count
+        let partial = states.filter { $0.status == .partiallyStopped }.count
+        if partial == 0 {
+            if stopped == 0 { return nil }
+            return stopped == 1 ? "1 session paused" : "\(stopped) sessions paused"
+        }
+        if stopped == 0 {
+            return partial == 1
+                ? "1 session partially paused"
+                : "\(partial) sessions partially paused"
+        }
+        return "\(stopped + partial) sessions paused or partially paused"
+    }
+
     private var footer: some View {
         HStack {
             if let settingsError = model.settingsError {
@@ -591,10 +670,9 @@ struct PanelView: View {
                 Label("collector update required", systemImage: "exclamationmark.triangle")
                     .font(.caption2)
                     .foregroundStyle(.orange)
-            } else if !model.pausedSessionKeys.isEmpty {
-                let count = model.pausedSessionKeys.count
+            } else if let pausedSessionFooterText {
                 Label(
-                    count == 1 ? "1 session paused" : "\(count) sessions paused",
+                    pausedSessionFooterText,
                     systemImage: "pause.circle.fill"
                 )
                 .font(.caption2)
@@ -648,7 +726,7 @@ struct PanelView: View {
         let headers = CGFloat(model.familyGroups.count) * 27
         let expansion = model.expandedKey == nil
             ? 0
-            : CGFloat(max(model.expandedChildren.count, 1)) * 20 + 10
+            : CGFloat(max(model.expandedProcesses.count, 1)) * 20 + 10
         return min(rows + headers + expansion + 16, 380)
     }
 

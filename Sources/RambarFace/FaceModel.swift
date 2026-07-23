@@ -21,7 +21,7 @@ final class FaceModel: ObservableObject {
     @Published var sampledAgo: Double = .infinity
     @Published var notificationsEnabled: Bool
     @Published var groupByApp: Bool
-    @Published var pausedSessionKeys: Set<String> = []
+    @Published var sessionInterventionStates: [String: SessionTreeInterventionState] = [:]
     @Published var interventionMessages: [String: String] = [:]
     @Published var interveningKeys: Set<String> = []
     @Published var autoPauseEnabled: Bool
@@ -105,7 +105,7 @@ final class FaceModel: ObservableObject {
             history = store.systemHistory(since: now - 3_600)
             orphans = store.latestOrphanState()
             reconcileExpansion()
-            refreshPausedSessions()
+            refreshSessionInterventionStates()
             return
         }
 
@@ -115,7 +115,7 @@ final class FaceModel: ObservableObject {
         history = store.systemHistory(since: now - 3_600)
         orphans = store.latestOrphanState()
         reconcileExpansion()
-        refreshPausedSessions()
+        refreshSessionInterventionStates()
 
         var nowRising: Set<String> = []
         for session in sessions {
@@ -197,8 +197,16 @@ final class FaceModel: ObservableObject {
 
         Task.detached(priority: .userInitiated) {
             let result = performSessionIntervention(root: root, action: action)
+            let observedState = buildSessionTrees(collectProcessSamples())
+                .first { $0.root.identity == root }
+                .map(sessionTreeInterventionState)
             await MainActor.run { [weak self] in
-                self?.finishIntervention(result, action: action, key: key)
+                self?.finishIntervention(
+                    result,
+                    action: action,
+                    key: key,
+                    observedState: observedState
+                )
             }
         }
     }
@@ -206,14 +214,19 @@ final class FaceModel: ObservableObject {
     private func finishIntervention(
         _ result: SessionInterventionResult,
         action: SessionInterventionAction,
-        key: String
+        key: String,
+        observedState: SessionTreeInterventionState?
     ) {
         interveningKeys.remove(key)
+        if let observedState {
+            sessionInterventionStates[key] = observedState
+        } else {
+            sessionInterventionStates.removeValue(forKey: key)
+        }
+
         if !result.foundSession {
             interventionMessages[key] = "Session ended before it could be signaled."
-        } else if result.signaledProcessCount == 0 {
-            interventionMessages[key] = "No matching live processes were signaled."
-        } else {
+        } else if result.completedAllTargets {
             let verb: String
             switch action {
             case .interrupt: verb = "Interrupt sent to"
@@ -223,22 +236,32 @@ final class FaceModel: ObservableObject {
             }
             let noun = result.signaledProcessCount == 1 ? "process" : "processes"
             interventionMessages[key] = "\(verb) \(result.signaledProcessCount) \(noun)."
-            if action == .pause {
-                pausedSessionKeys.insert(key)
-            } else if action == .resume || action == .terminate {
-                pausedSessionKeys.remove(key)
+        } else {
+            let label: String
+            switch action {
+            case .interrupt: label = "Interrupt incomplete"
+            case .pause: label = "Pause incomplete"
+            case .resume: label = "Resume incomplete"
+            case .terminate: label = "End request incomplete"
             }
+            interventionMessages[key] = "\(label): "
+                + "\(result.signaledProcessCount) of \(result.targetedProcessCount) signaled"
+                + " · \(result.failedProcessCount) failed"
+                + " · \(result.staleProcessCount) stale"
+                + " · \(result.missedProcessCount) missed."
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.75) { [weak self] in
             self?.refresh()
         }
     }
 
-    private func refreshPausedSessions() {
-        pausedSessionKeys = Set(sessions.compactMap { session in
-            let identity = ProcessIdentity(pid: session.rootPid, start: session.rootStart)
-            return processIsStopped(identity) == true ? session.key : nil
-        })
+    private func refreshSessionInterventionStates() {
+        let activeKeys = Set(sessions.map(\.key))
+        sessionInterventionStates = buildSessionTrees(collectProcessSamples())
+            .reduce(into: [:]) { result, tree in
+                guard activeKeys.contains(tree.key) else { return }
+                result[tree.key] = sessionTreeInterventionState(tree)
+            }
     }
 
     // MARK: - Orphan reclaim
@@ -326,6 +349,12 @@ final class FaceModel: ObservableObject {
     var pressure: PressureLevel { system?.pressure ?? .normal }
 
     var attributedTotal: UInt64 { sessions.reduce(0) { $0 + $1.footprint } }
+
+    var pausedSessionKeys: Set<String> {
+        Set(sessionInterventionStates.compactMap { key, state in
+            state.status == .running ? nil : key
+        })
+    }
 
     var menuBarSymbolName: String {
         if !pausedSessionKeys.isEmpty { return "pause.circle.fill" }

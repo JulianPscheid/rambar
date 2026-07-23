@@ -237,7 +237,8 @@ public func collectProcessSamples() -> [ProcessSample] {
             isAgentInfrastructure: agentMetadata.isInfrastructure,
             cwd: Proc.workingDirectory(pid),
             footprint: Proc.physicalFootprint(pid) ?? 0,
-            startTime: info.startTime
+            startTime: info.startTime,
+            isStopped: info.status == SSTOP
         ))
     }
     return samples

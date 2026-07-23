@@ -15,6 +15,27 @@ public struct SessionInterventionResult: Equatable, Sendable {
     public let signaledProcessCount: Int
     public let staleProcessCount: Int
     public let failedProcessCount: Int
+
+    /// Targets skipped after a root failure or otherwise left unaccounted for.
+    public var missedProcessCount: Int {
+        max(
+            0,
+            targetedProcessCount
+                - signaledProcessCount
+                - staleProcessCount
+                - failedProcessCount
+        )
+    }
+
+    /// Signal delivery is complete only when every sampled target succeeded.
+    public var completedAllTargets: Bool {
+        foundSession
+            && targetedProcessCount > 0
+            && signaledProcessCount == targetedProcessCount
+            && staleProcessCount == 0
+            && failedProcessCount == 0
+            && missedProcessCount == 0
+    }
 }
 
 func processIdentity(pid: Int32) -> ProcessIdentity? {

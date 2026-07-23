@@ -30,6 +30,8 @@ public struct ProcessSample: Hashable, Sendable {
     /// Process start time, unix seconds. (pid, startTime) is the stable
     /// identity used everywhere; pid reuse gets a new startTime.
     public let startTime: Double
+    /// Whether the process was stopped at this sampling instant.
+    public let isStopped: Bool
 
     public init(
         pid: Int32,
@@ -41,7 +43,8 @@ public struct ProcessSample: Hashable, Sendable {
         isAgentInfrastructure: Bool = false,
         cwd: String? = nil,
         footprint: UInt64 = 0,
-        startTime: Double = 0
+        startTime: Double = 0,
+        isStopped: Bool = false
     ) {
         self.pid = pid
         self.ppid = ppid
@@ -53,6 +56,7 @@ public struct ProcessSample: Hashable, Sendable {
         self.cwd = cwd
         self.footprint = footprint
         self.startTime = startTime
+        self.isStopped = isStopped
     }
 
     /// What this process is, for humans: the script it runs when it is an

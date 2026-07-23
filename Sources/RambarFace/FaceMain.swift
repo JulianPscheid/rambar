@@ -110,7 +110,10 @@ private func expandFirstSession(model: FaceModel, showPaused: Bool) {
     model.toggleExpansion(group)
     model.toggleExpansion(session)
     if showPaused {
-        model.pausedSessionKeys.insert(session.key)
+        model.sessionInterventionStates[session.key] = SessionTreeInterventionState(
+            stoppedProcessCount: max(session.processCount, 1),
+            runningProcessCount: 0
+        )
     }
 }
 
