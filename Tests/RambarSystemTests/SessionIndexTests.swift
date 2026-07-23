@@ -131,7 +131,7 @@ final class SessionIndexTests: XCTestCase {
         XCTAssertEqual(identities[trees[1].key]?.title, "Audit the release build")
     }
 
-    func testClaudeResumeHintWinsOverStartTime() throws {
+    func testClaudeFreshResumeHintWinsOverStartTime() throws {
         let home = NSTemporaryDirectory() + "rambar-home-\(UUID().uuidString)"
         let projectDirectory = home + "/.claude/projects/-Users-x-proj"
         try FileManager.default.createDirectory(
@@ -139,14 +139,19 @@ final class SessionIndexTests: XCTestCase {
         )
         defer { try? FileManager.default.removeItem(atPath: home) }
 
+        let start = Date().timeIntervalSince1970
         let id = "33333333-3333-4333-8333-333333333333"
+        let path = projectDirectory + "/\(id).jsonl"
         try claudeTranscript(
             id: id,
             title: "Continue the older investigation",
-            timestamp: Date().timeIntervalSince1970 - 86_400,
-            path: projectDirectory + "/\(id).jsonl"
+            timestamp: start - 86_400,
+            path: path
         )
-        let start = Date().timeIntervalSince1970
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date(timeIntervalSince1970: start - 30)],
+            ofItemAtPath: path
+        )
         let trees = buildSessionTrees([
             ProcessSample(pid: 1, ppid: 0, execPath: "/sbin/launchd"),
             ProcessSample(
@@ -160,6 +165,99 @@ final class SessionIndexTests: XCTestCase {
         let identity = try XCTUnwrap(SessionIndex(home: home).identities(for: trees).values.first)
         XCTAssertEqual(identity.sessionID, id)
         XCTAssertEqual(identity.title, "Continue the older investigation")
+    }
+
+    func testClaudeStaleResumeHintFallsBackWithoutClaimingTranscript() throws {
+        let home = NSTemporaryDirectory() + "rambar-home-\(UUID().uuidString)"
+        let projectDirectory = home + "/.claude/projects/-Users-x-proj"
+        try FileManager.default.createDirectory(
+            atPath: projectDirectory, withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(atPath: home) }
+
+        let start = Date().timeIntervalSince1970
+        let id = "44444444-4444-4444-8444-444444444444"
+        let path = projectDirectory + "/\(id).jsonl"
+        try claudeTranscript(
+            id: id,
+            title: "Dormant resume source",
+            timestamp: start - 86_400,
+            path: path
+        )
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date(timeIntervalSince1970: start - 61)],
+            ofItemAtPath: path
+        )
+        let trees = buildSessionTrees([
+            ProcessSample(pid: 1, ppid: 0, execPath: "/sbin/launchd"),
+            ProcessSample(
+                pid: 10, ppid: 1,
+                execPath: "/Users/x/.local/share/claude/versions/2.1.216",
+                sessionIDHint: id,
+                cwd: "/Users/x/proj", startTime: start
+            ),
+        ])
+
+        XCTAssertNil(SessionIndex(home: home).identities(for: trees)[trees[0].key])
+    }
+
+    func testCodexHintsRequireFreshRolloutModificationTime() throws {
+        let home = NSTemporaryDirectory() + "rambar-home-\(UUID().uuidString)"
+        let sessionsDirectory = home + "/.codex/sessions/2026/07/21"
+        try FileManager.default.createDirectory(
+            atPath: sessionsDirectory, withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(atPath: home) }
+
+        let staleID = "019f81d6-f643-7003-b55c-856d51701c90"
+        let freshID = "019f81d6-f643-7003-b55c-856d51701c91"
+        let start = Date().timeIntervalSince1970
+        let sessionIndex = """
+        {"id":"\(staleID)","thread_name":"Dormant Codex conversation"}
+        {"id":"\(freshID)","thread_name":"Active Codex conversation"}
+        """
+        try sessionIndex.write(
+            toFile: home + "/.codex/session_index.jsonl", atomically: true, encoding: .utf8
+        )
+
+        let stalePath =
+            sessionsDirectory + "/rollout-2026-07-21T10-00-00-\(staleID).jsonl"
+        let freshPath =
+            sessionsDirectory + "/rollout-2026-07-21T10-00-01-\(freshID).jsonl"
+        let staleRollout = """
+        {"timestamp":"\(iso8601(start - 86_400))","type":"session_meta","payload":{"id":"\(staleID)","timestamp":"\(iso8601(start - 86_400))","cwd":"/Users/x/proj"}}
+        """
+        let freshRollout = """
+        {"timestamp":"\(iso8601(start - 86_400))","type":"session_meta","payload":{"id":"\(freshID)","timestamp":"\(iso8601(start - 86_400))","cwd":"/Users/x/proj"}}
+        """
+        try staleRollout.write(toFile: stalePath, atomically: true, encoding: .utf8)
+        try freshRollout.write(toFile: freshPath, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date(timeIntervalSince1970: start - 61)],
+            ofItemAtPath: stalePath
+        )
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date(timeIntervalSince1970: start - 30)],
+            ofItemAtPath: freshPath
+        )
+
+        let trees = buildSessionTrees([
+            ProcessSample(pid: 1, ppid: 0, execPath: "/sbin/launchd"),
+            ProcessSample(
+                pid: 10, ppid: 1, execPath: "/opt/homebrew/bin/codex",
+                sessionIDHint: staleID,
+                cwd: "/Users/x/proj", startTime: start
+            ),
+            ProcessSample(
+                pid: 11, ppid: 1, execPath: "/opt/homebrew/bin/codex",
+                sessionIDHint: freshID,
+                cwd: "/Users/x/proj", startTime: start
+            ),
+        ])
+
+        let identities = SessionIndex(home: home).identities(for: trees)
+        XCTAssertNil(identities[trees[0].key])
+        XCTAssertEqual(identities[trees[1].key]?.title, "Active Codex conversation")
     }
 
     func testCodexThreadNameResolvesFromRolloutStart() throws {

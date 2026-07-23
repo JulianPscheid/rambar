@@ -22,6 +22,7 @@ public struct SessionIndex {
         let id: String
         let cwd: String
         let startedAt: Double?
+        let modifiedAt: Double
         let title: String?
     }
 
@@ -33,6 +34,7 @@ public struct SessionIndex {
     private let fileManager: FileManager
     private let claudeProjectsRoot: String
     private let codexRoot: String
+    private let hintFreshnessAllowance: TimeInterval = 60
     private let matchWindow: TimeInterval = 10 * 60
 
     public init(home: String, fileManager: FileManager = .default) {
@@ -49,7 +51,7 @@ public struct SessionIndex {
 
     /// Resolve a batch so concurrent sessions in one working directory are
     /// matched one-to-one instead of all claiming the newest transcript.
-    /// Explicit resume IDs win; otherwise the closest transcript/rollout
+    /// Fresh explicit resume IDs win; otherwise the closest transcript/rollout
     /// start within ten minutes is used.
     public func identities(
         for trees: [AgentSessionTree],
@@ -74,7 +76,8 @@ public struct SessionIndex {
             guard let hint = hints[tree.key] else { continue }
             let candidateKey = "\(tree.family.rawValue):\(hint)"
             guard !claimedCandidates.contains(candidateKey),
-                  let candidate = candidateByFamilyAndID[candidateKey] else {
+                  let candidate = candidateByFamilyAndID[candidateKey],
+                  candidate.modifiedAt >= tree.root.startTime - hintFreshnessAllowance else {
                 continue
             }
             result[tree.key] = IndexedSessionIdentity(
@@ -139,16 +142,19 @@ public struct SessionIndex {
         for (cwd, cwdTrees) in byCwd {
             let directory = claudeDirectory(cwd: cwd)
             guard let entries = try? fileManager.contentsOfDirectory(atPath: directory) else { continue }
-            let hintedIDs = Set(cwdTrees.compactMap { hints[$0.key] })
-            let unhintedTrees = cwdTrees.filter { hints[$0.key] == nil }
             for entry in entries where entry.hasSuffix(".jsonl") {
                 let id = String(entry.dropLast(".jsonl".count))
                 let path = directory + "/" + entry
-                let hinted = hintedIDs.contains(id)
-                if !hinted {
-                    guard let attributes = try? fileManager.attributesOfItem(atPath: path),
-                          let created = attributes[.creationDate] as? Date,
-                          unhintedTrees.contains(where: {
+                guard let attributes = try? fileManager.attributesOfItem(atPath: path),
+                      let modified = attributes[.modificationDate] as? Date else { continue }
+                let modifiedAt = modified.timeIntervalSince1970
+                let freshlyHinted = cwdTrees.contains { tree in
+                    hints[tree.key] == id
+                        && modifiedAt >= tree.root.startTime - hintFreshnessAllowance
+                }
+                if !freshlyHinted {
+                    guard let created = attributes[.creationDate] as? Date,
+                          cwdTrees.contains(where: {
                               abs(created.timeIntervalSince1970 - $0.root.startTime) <= matchWindow
                           }) else { continue }
                 }
@@ -158,6 +164,7 @@ public struct SessionIndex {
                     id: id,
                     cwd: cwd,
                     startedAt: metadata.startedAt,
+                    modifiedAt: modifiedAt,
                     title: metadata.title
                 ))
             }
@@ -234,8 +241,6 @@ public struct SessionIndex {
             return []
         }
         let names = codexThreadNames()
-        let hintedIDs = Set(codexTrees.compactMap { hints[$0.key] })
-        let unhintedTrees = codexTrees.filter { hints[$0.key] == nil }
         var candidates: [Candidate] = []
 
         for case let relativePath as String in enumerator {
@@ -243,11 +248,16 @@ public struct SessionIndex {
                   relativePath.contains("rollout-") else { continue }
             let path = codexRoot + "/sessions/" + relativePath
             let filename = (relativePath as NSString).lastPathComponent
-            let hinted = hintedIDs.contains { filename.contains($0) }
-            if !hinted {
-                guard let attributes = try? fileManager.attributesOfItem(atPath: path),
-                      let created = attributes[.creationDate] as? Date,
-                      unhintedTrees.contains(where: {
+            guard let attributes = try? fileManager.attributesOfItem(atPath: path),
+                  let modified = attributes[.modificationDate] as? Date else { continue }
+            let modifiedAt = modified.timeIntervalSince1970
+            let freshlyHinted = codexTrees.contains { tree in
+                guard let hint = hints[tree.key], filename.contains(hint) else { return false }
+                return modifiedAt >= tree.root.startTime - hintFreshnessAllowance
+            }
+            if !freshlyHinted {
+                guard let created = attributes[.creationDate] as? Date,
+                      codexTrees.contains(where: {
                           abs(created.timeIntervalSince1970 - $0.root.startTime) <= matchWindow
                       }) else { continue }
             }
@@ -257,6 +267,7 @@ public struct SessionIndex {
                 id: metadata.id,
                 cwd: metadata.cwd,
                 startedAt: metadata.startedAt,
+                modifiedAt: modifiedAt,
                 title: names[metadata.id] ?? metadata.fallbackTitle
             ))
         }
