@@ -4,9 +4,15 @@ import RambarSystem
 
 struct EndSessionConfirmationRequest {
     let session: SessionRecord
+    let force: Bool
 
-    func perform(_ action: (SessionRecord) -> Void) {
-        action(session)
+    init(session: SessionRecord, force: Bool = false) {
+        self.session = session
+        self.force = force
+    }
+
+    func perform(_ action: (SessionRecord, SessionInterventionAction) -> Void) {
+        action(session, force ? .forceTerminate : .terminate)
     }
 }
 
@@ -45,21 +51,26 @@ struct PanelView: View {
         }
         .frame(width: 344)
         .confirmationDialog(
-            "End \(pendingEndRequest?.session.displayName ?? "session")?",
+            "\(pendingEndRequest?.force == true ? "Force end" : "End") "
+                + "\(pendingEndRequest?.session.displayName ?? "session")?",
             isPresented: endConfirmationPresented,
             titleVisibility: .visible
         ) {
             if let request = pendingEndRequest {
-                Button("End session", role: .destructive) {
-                    request.perform {
-                        model.intervene($0, action: .terminate)
+                Button(request.force ? "Force end" : "End session", role: .destructive) {
+                    request.perform { session, action in
+                        model.intervene(session, action: action)
                     }
                     pendingEndRequest = nil
                 }
             }
             Button("Cancel", role: .cancel) { pendingEndRequest = nil }
         } message: {
-            Text("Rambar will send SIGTERM to the verified process tree. Unsaved work in that session may be lost.")
+            if pendingEndRequest?.force == true {
+                Text("Graceful termination failed. Rambar will send SIGKILL to the verified process tree. The session cannot save or clean up first.")
+            } else {
+                Text("Rambar will send SIGTERM to the verified process tree. Unsaved work in that session may be lost.")
+            }
         }
     }
 
@@ -442,6 +453,7 @@ struct PanelView: View {
 
     private func sessionControls(_ session: SessionRecord) -> some View {
         let busy = model.interveningKeys.contains(session.key)
+        let forceEndRequired = model.forceEndRequiredKeys.contains(session.key)
         let state = model.sessionInterventionStates[session.key]
             ?? SessionTreeInterventionState(
                 stoppedProcessCount: 0,
@@ -503,14 +515,19 @@ struct PanelView: View {
         .help("Resume this session's verified process tree")
 
         let endButton = Button {
-            pendingEndRequest = EndSessionConfirmationRequest(session: session)
+            pendingEndRequest = EndSessionConfirmationRequest(
+                session: session,
+                force: forceEndRequired
+            )
         } label: {
-            Label("End", systemImage: "power")
+            Label(forceEndRequired ? "Force End" : "End", systemImage: "power")
                 .frame(maxWidth: .infinity)
         }
         .buttonStyle(.bordered)
         .tint(.red)
-        .help("Ask this session's verified process tree to terminate")
+        .help(forceEndRequired
+            ? "Force the verified process tree to exit after graceful termination failed"
+            : "Ask this session's verified process tree to terminate")
 
         return VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 6) {
